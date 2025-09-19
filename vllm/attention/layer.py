@@ -239,6 +239,14 @@ class Attention(nn.Module, AttentionLayerBase):
         context using
         `vllm.forward_context.get_forward_context().attn_metadata`.
         """
+        # --- Upstream instrumentation (DCA / head mismatch tracing) ---
+        try:
+            print("DEBUG:ATTN_FWD: entry raw qkv shapes q=", query.shape, " k=", (None if key is None else key.shape),
+                  " v=", (None if value is None else value.shape),
+                  " num_heads=", self.num_heads, " num_kv_heads=", self.num_kv_heads,
+                  " head_size=", self.head_size, " impl=", self.impl.__class__.__name__)
+        except Exception as _e:
+            print("DEBUG:ATTN_FWD: entry instrumentation exception", _e)
         if self.calculate_kv_scales:
             attn_metadata = get_forward_context().attn_metadata
             if attn_metadata.enable_kv_scales_calculation:
@@ -257,18 +265,35 @@ class Attention(nn.Module, AttentionLayerBase):
                 # Reshape the query, key, and value tensors.
                 # NOTE(woosuk): We do this outside the custom op to minimize the
                 # CPU overheads from the non-CUDA-graph regions.
+                try:
+                    print("DEBUG:ATTN_FWD: pre-view q.shape=", query.shape, " expecting (-1,", self.num_heads, ",", self.head_size, ")",
+                          " k.shape=", (None if key is None else key.shape),
+                          " v.shape=", (None if value is None else value.shape))
+                except Exception as _e:
+                    print("DEBUG:ATTN_FWD: pre-view instrumentation exception", _e)
                 query = query.view(-1, self.num_heads, self.head_size)
                 output = output.view(-1, self.num_heads, self.head_size)
                 if key is not None:
                     key = key.view(-1, self.num_kv_heads, self.head_size)
                 if value is not None:
                     value = value.view(-1, self.num_kv_heads, self.head_size)
+                try:
+                    print("DEBUG:ATTN_FWD: post-view q=", query.shape, " k=", (None if key is None else key.shape),
+                          " v=", (None if value is None else value.shape),
+                          " num_queries_per_kv=", (self.num_heads // self.num_kv_heads))
+                except Exception as _e:
+                    print("DEBUG:ATTN_FWD: post-view instrumentation exception", _e)
             if self.use_direct_call:
                 forward_context: ForwardContext = get_forward_context()
                 attn_metadata = forward_context.attn_metadata
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                try:
+                    print("DEBUG:ATTN_FWD: invoking impl.forward with q=", query.shape, " k=", (None if key is None else key.shape),
+                          " v=", (None if value is None else value.shape), " backend_impl=", self.impl.__class__.__name__)
+                except Exception as _e:
+                    print("DEBUG:ATTN_FWD: invoke instrumentation exception", _e)
                 self.impl.forward(self,
                                   query,
                                   key,
@@ -287,6 +312,11 @@ class Attention(nn.Module, AttentionLayerBase):
                 if isinstance(attn_metadata, dict):
                     attn_metadata = attn_metadata[self.layer_name]
                 self_kv_cache = self.kv_cache[forward_context.virtual_engine]
+                try:
+                    print("DEBUG:ATTN_FWD: (no-output mode) invoking impl.forward with q=", query.shape,
+                          " k=", (None if key is None else key.shape), " v=", (None if value is None else value.shape))
+                except Exception as _e:
+                    print("DEBUG:ATTN_FWD: no-output invoke instrumentation exception", _e)
                 return self.impl.forward(self, query, key, value,
                                          self_kv_cache, attn_metadata)
             else:

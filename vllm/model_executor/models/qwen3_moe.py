@@ -270,7 +270,21 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        try:
+            print("DEBUG:QWEN3_MOE_ATTn: qkv_proj output shape=", qkv.shape,
+                  " hidden_states.shape=", hidden_states.shape,
+                  " q_size=", self.q_size, " kv_size=", self.kv_size,
+                  " total_num_heads=", self.total_num_heads,
+                  " total_num_kv_heads=", self.total_num_kv_heads,
+                  " local_num_heads=", self.num_heads, " local_num_kv_heads=", self.num_kv_heads,
+                  " head_dim=", self.head_dim)
+        except Exception as _e:
+            print("DEBUG:QWEN3_MOE_ATTn: qkv instrumentation exception", _e)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        try:
+            print("DEBUG:QWEN3_MOE_ATTn: split q=", q.shape, " k=", k.shape, " v=", v.shape)
+        except Exception as _e:
+            print("DEBUG:QWEN3_MOE_ATTn: split instrumentation exception", _e)
         # Add qk-norm
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim,
                            self.head_dim)
@@ -281,7 +295,15 @@ class Qwen3MoeAttention(nn.Module):
                            self.head_dim)
         k_by_head = self.k_norm(k_by_head)
         k = k_by_head.view(k.shape)
+        try:
+            print("DEBUG:QWEN3_MOE_ATTn: after norm q=", q.shape, " k=", k.shape, " v=", v.shape)
+        except Exception as _e:
+            print("DEBUG:QWEN3_MOE_ATTn: post-norm instrumentation exception", _e)
         q, k = self.rotary_emb(positions, q, k)
+        try:
+            print("DEBUG:QWEN3_MOE_ATTn: after rotary q=", q.shape, " k=", k.shape)
+        except Exception as _e:
+            print("DEBUG:QWEN3_MOE_ATTn: rotary instrumentation exception", _e)
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output

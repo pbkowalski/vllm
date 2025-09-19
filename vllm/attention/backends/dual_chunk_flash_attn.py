@@ -408,6 +408,27 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
                 " for FlashAttentionImpl")
+        # --- Begin added upstream tracing instrumentation ---
+        try:
+            orig_fused_query_dim = query.shape[-1]
+            print("DEBUG:DCA_FWD: incoming fused query shape =", query.shape,
+                  " num_heads=", self.num_heads, " head_size=", self.head_size,
+                  " num_kv_heads=", self.num_kv_heads,
+                  " num_queries_per_kv=", self.num_queries_per_kv)
+            if orig_fused_query_dim % (self.num_heads * self.head_size) == 0:
+                factor = orig_fused_query_dim // (self.num_heads * self.head_size)
+                print("DEBUG:DCA_FWD: fused_query_dim_factor =", factor,
+                      "(= fused_dim / (num_heads*head_size))")
+                if factor == 5:
+                    print("DEBUG:DCA_FWD: Detected 5-way fused DCA query (expected for dual chunk).")
+                else:
+                    print("DEBUG:DCA_FWD: Unexpected fusion factor (expected 5).")
+            else:
+                print("DEBUG:DCA_FWD: fused query dim NOT divisible by num_heads*head_size:",
+                      orig_fused_query_dim, "/", (self.num_heads * self.head_size))
+        except Exception as _e:
+            print("DEBUG:DCA_FWD: pre-split instrumentation exception", _e)
+        # --- End added upstream tracing instrumentation ---
 
         (
             query,
@@ -417,6 +438,31 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             query_inter_critical,
         ) = torch.split(query, query.shape[-1] // 5, dim=-1)
 
+        # --- DEBUG instrumentation to trace head mismatch issues ---
+        try:
+            # Capture raw part sizes before any reshape
+            print("DEBUG: DCA forward raw part sizes:")
+            print("DEBUG:   part0(query) shape:", query.shape)
+            print("DEBUG:   part1(query_succ) shape:", query_succ.shape)
+            print("DEBUG:   part2(query_inter) shape:", query_inter.shape)
+            print("DEBUG:   part3(query_succ_critical) shape:", query_succ_critical.shape)
+            print("DEBUG:   part4(query_inter_critical) shape:", query_inter_critical.shape)
+            inferred_hidden_size = query.shape[-1] * 5
+            expected_hidden_size = self.num_heads * self.head_size
+            if inferred_hidden_size != expected_hidden_size:
+                print("DEBUG: hidden_size_mismatch inferred_total=" , inferred_hidden_size,
+                      " expected=", expected_hidden_size,
+                      " num_heads=", self.num_heads,
+                      " head_size=", self.head_size)
+                if query.shape[-1] % self.head_size != 0:
+                    print("DEBUG: part0 length not divisible by head_size; part0_len=", query.shape[-1],
+                          " head_size=", self.head_size)
+            # Show intended reshape target
+            print("DEBUG: intended reshape for query parts -> (-1, num_heads=", self.num_heads,
+                  ", head_size=", self.head_size, ")")
+        except Exception as _e:  # pragma: no cover - debug safety
+            print("DEBUG: instrumentation exception", _e)
+
         assert (
             query_succ is not None and query_inter is not None
         ), "query_succ and query_inter are required in Dual Chunk Attention."
@@ -424,6 +470,16 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         num_tokens, hidden_size = query.shape
 
         # Reshape the query, key, and value tensors.
+        try:
+            print("DEBUG:DCA_FWD: pre-view raw part shapes main=", query.shape,
+                  " succ=", query_succ.shape, " inter=", query_inter.shape,
+                  " succ_crit=", query_succ_critical.shape, " inter_crit=", query_inter_critical.shape)
+            print("DEBUG:DCA_FWD: pre-view raw KV shapes key=", key.shape, " value=", value.shape,
+                  " expecting per-part dim=", self.num_heads * self.head_size,
+                  " num_heads=", self.num_heads, " num_kv_heads=", self.num_kv_heads,
+                  " head_size=", self.head_size)
+        except Exception as _e:
+            print("DEBUG:DCA_FWD: pre-view KV instrumentation exception", _e)
         query = query.view(-1, self.num_heads, self.head_size)
         query_succ = query_succ.view(-1, self.num_heads, self.head_size)
         query_inter = query_inter.view(-1, self.num_heads, self.head_size)
@@ -433,6 +489,28 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             -1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
+        try:
+            print("DEBUG:DCA_FWD: post-view shapes q=", query.shape, " k=", key.shape,
+                  " v=", value.shape, " num_queries_per_kv=", self.num_queries_per_kv)
+        except Exception as _e:
+            print("DEBUG:DCA_FWD: post-view KV instrumentation exception", _e)
+
+        # Additional KV debug
+        try:
+            if key.shape[-1] != self.head_size:
+                print("DEBUG: key head_dim mismatch key.shape=", key.shape,
+                      " expected head_size=", self.head_size)
+            if value.shape[-1] != self.head_size:
+                print("DEBUG: value head_dim mismatch value.shape=", value.shape,
+                      " expected head_size=", self.head_size)
+            if query.shape[1] != self.num_heads:
+                print("DEBUG: query heads mismatch after view query.shape=", query.shape,
+                      " num_heads=", self.num_heads)
+            if key.shape[1] != self.num_kv_heads:
+                print("DEBUG: key kv_heads mismatch after view key.shape=", key.shape,
+                      " num_kv_heads=", self.num_kv_heads)
+        except Exception as _e:  # pragma: no cover
+            print("DEBUG: KV instrumentation exception", _e)
 
         paged_attn = self.paged_attn_module
 
@@ -597,6 +675,41 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         chunk_size: int = 8192,
         local_size: int = 1024,
     ):
+        # DEBUG: Log tensor shapes at function entry
+        print(f"DEBUG:DCA_PREFILL_ENTRY: k.shape={k.shape} v.shape={v.shape}")
+        print(f"DEBUG:DCA_PREFILL_ENTRY: q.shape={q.shape} q_succ.shape={q_succ.shape}")
+        print(f"DEBUG:DCA_PREFILL_ENTRY: cu_seqlens_q={cu_seqlens_q} cu_seqlens_k={cu_seqlens_k}")
+        
+        # Fix tensor shapes: convert 5D cache tensors to expected 3D format
+        # Expected format: [seq_len, num_kv_heads, head_dim]
+        # For this GQA model: num_kv_heads=1, head_dim=128
+        if k.dim() == 5:
+            # k has shape [seq_len, 1, 16, 16, 8] for this model
+            # For GQA with 1 KV head, reshape to [seq_len, 1, 128]
+            seq_len = k.shape[0]
+            k = k.view(seq_len, 1, -1)  # Flatten everything after seq_len
+            if k.shape[2] > 128:
+                # Take first 128 dims if head_dim is larger 
+                k = k[:, :, :128]
+            print(f"DEBUG:DCA_PREFILL_ENTRY: Reshaped k from 5D to {k.shape}")
+            
+        if v.dim() == 5:
+            # v has shape [seq_len, 1, 128, 16] 
+            seq_len = v.shape[0]
+            v = v.view(seq_len, 1, -1)  # Flatten to get head_dim
+            if v.shape[2] > 128:
+                # Take first 128 dims
+                v = v[:, :, :128]
+            print(f"DEBUG:DCA_PREFILL_ENTRY: Reshaped v from 5D to {v.shape}")
+        elif v.dim() == 4:
+            # v has shape [seq_len, 1, 128, 16]
+            seq_len = v.shape[0]
+            v = v.view(seq_len, 1, -1)  # Flatten to [seq_len, 1, head_dim]
+            if v.shape[2] > 128:
+                # Take first 128 dims  
+                v = v[:, :, :128]
+            print(f"DEBUG:DCA_PREFILL_ENTRY: Reshaped v from 4D to {v.shape}")
+        
         if alibi_slopes is not None:
             raise ValueError(
                 "Dual Chunk Attention does not support alibi_slopes")
@@ -609,6 +722,12 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
 
         cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
         cu_seqlens_k_cpu = cu_seqlens_k.cpu().tolist()
+        
+        # DEBUG: Log sequence length info
+        print(f"DEBUG:DCA_PREFILL: cu_seqlens_q_cpu={cu_seqlens_q_cpu}")
+        print(f"DEBUG:DCA_PREFILL: cu_seqlens_k_cpu={cu_seqlens_k_cpu}")
+        print(f"DEBUG:DCA_PREFILL: orig_seq_lens={orig_seq_lens}")
+        
         all_outputs = []
 
         for i in range(0, len(cu_seqlens_q_cpu) - 1):
@@ -616,6 +735,9 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             qe = cu_seqlens_q_cpu[i:i + 2][-1]
             ks = cu_seqlens_k_cpu[i]
             ke = cu_seqlens_k_cpu[i:i + 2][-1]
+            
+            # DEBUG: Log slicing indices
+            print(f"DEBUG:DCA_PREFILL: seq {i}: qs={qs} qe={qe} ks={ks} ke={ke}")
 
             current_q = q[qs:qe]
             current_q_succ = q_succ[qs:qe]
@@ -633,6 +755,11 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 current_orig_seq_len = orig_seq_lens[i]
                 current_k = k
                 current_v = v
+            
+            # DEBUG: Log shapes at this level before per-head processing
+            print(f"DEBUG:DCA_PREFILL: after slicing current_k.shape={current_k.shape} current_v.shape={current_v.shape}")
+            print(f"DEBUG:DCA_PREFILL: block_table_exists={block_table is not None} num_queries_per_kv={self.num_queries_per_kv}")
+            print(f"DEBUG:DCA_PREFILL: current_q.shape={current_q.shape}")
             sparse_attn_enabled = (self.sparse_attention_enabled
                                    and current_orig_seq_len
                                    > self.sparse_attention_threshold)
@@ -703,16 +830,31 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     current_q_inter_head_critical = \
                         current_q_inter_critical[:, head_id, :].unsqueeze(1)
                     if block_table is not None:
-                        current_k_head = current_k[..., head_id //
-                                                   group_size, :].unsqueeze(2)
-                        current_v_head = current_v[..., head_id //
-                                                   group_size, :].unsqueeze(2)
-
+                        # For GQA, reuse the single KV head instead of slicing
+                        if self.num_queries_per_kv > 1:  # GQA case
+                            current_k_head = current_k.unsqueeze(2)  # [seq_len, num_kv_heads, head_dim] -> [seq_len, num_kv_heads, head_dim, 1]
+                            current_v_head = current_v.unsqueeze(2)  # [seq_len, num_kv_heads, head_dim] -> [seq_len, num_kv_heads, head_dim, 1]
+                        else:  # MHA case
+                            current_k_head = current_k[..., head_id //
+                                                       group_size, :].unsqueeze(2)
+                            current_v_head = current_v[..., head_id //
+                                                       group_size, :].unsqueeze(2)
+                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: block_table case head_id={head_id} group_size={group_size} gqa={self.num_queries_per_kv > 1}")
+                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_k_head.shape={current_k_head.shape}")
+                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_v_head.shape={current_v_head.shape}")
                     else:
-                        current_k_head = current_k[:, head_id //
-                                                   group_size, :].unsqueeze(1)
-                        current_v_head = current_v[:, head_id //
-                                                   group_size, :].unsqueeze(1)
+                        # For GQA, reuse the single KV head instead of slicing
+                        if self.num_queries_per_kv > 1:  # GQA case
+                            current_k_head = current_k  # [seq_len, num_kv_heads, head_dim] stays as is
+                            current_v_head = current_v  # [seq_len, num_kv_heads, head_dim] stays as is
+                        else:  # MHA case
+                            current_k_head = current_k[:, head_id //
+                                                       group_size, :].unsqueeze(1)
+                            current_v_head = current_v[:, head_id //
+                                                       group_size, :].unsqueeze(1)
+                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: non-block case head_id={head_id} group_size={group_size} gqa={self.num_queries_per_kv > 1}")
+                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_k_head.shape={current_k_head.shape}")
+                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_v_head.shape={current_v_head.shape}")
 
                     current_out = self._dual_chunk_flash_attn_prefill_func(
                         current_q_head,
@@ -754,6 +896,14 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         heads_slash_size=None,
         group_size=None,
     ):
+        try:
+            print("DEBUG:DCA_PREFILL_FUNC: entry q=", q.shape, " k=", k.shape, " v=", v.shape,
+                  " sparse=", sparse_attn_enabled, " group_size=", group_size,
+                  " chunk_size=", chunk_size, " local_size=", local_size,
+                  " k_length=", k_length, " softmax_scale=", softmax_scale,
+                  " scaling_factor=", scaling_factor)
+        except Exception as _e:
+            print("DEBUG:DCA_PREFILL_FUNC: entry instrumentation exception", _e)
         flash_results = []
         chunk_len = chunk_size - local_size
 
@@ -791,6 +941,11 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 block_tables_intra = None
                 k_states_intra = k[prev_chunk_end_pos:end]
                 v_states_intra = v[prev_chunk_end_pos:end]
+                
+            print(f"DEBUG:DCA_PREFILL_FUNC_SLICE: prev_chunk_end_pos={prev_chunk_end_pos} end={end}")
+            print(f"DEBUG:DCA_PREFILL_FUNC_SLICE: k_states_intra.shape={k_states_intra.shape}")
+            print(f"DEBUG:DCA_PREFILL_FUNC_SLICE: v_states_intra.shape={v_states_intra.shape}")
+            print(f"DEBUG:DCA_PREFILL_FUNC_SLICE: block_tables_intra={block_tables_intra is not None}")
 
             if sparse_attn_enabled:
                 last_q_size = min(qend - qbegin, self.sparse_attention_last_q)
@@ -1192,6 +1347,19 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         q_len = query_states.shape[0]
         q_heads = query_states.shape[1]
         h_dim = query_states.shape[-1]
+        try:
+            prod_q = q_heads * h_dim
+            prod_k = key_states.shape[1] * key_states.shape[-1]
+            print("DEBUG:DCA_DO: entry stage=", stage, " q=", query_states.shape,
+                  " k=", key_states.shape, " v=", value_states.shape,
+                  " q_heads*dim=", prod_q, " k_heads*dim=", prod_k,
+                  " causal=", causal, " sparse=", sparse_attn_enabled)
+            if q_heads == 1 and key_states.shape[1] > 1 and prod_q == prod_k:
+                print("DEBUG:DCA_DO: DETECTED_INVERTED_GQA q has aggregated head, k split into more heads (k_heads=", key_states.shape[1], ")")
+            if key_states.shape[-1] != h_dim and prod_q == prod_k:
+                print("DEBUG:DCA_DO: per-head dim mismatch but total fused dimension matches; likely head factoring difference")
+        except Exception as _e:
+            print("DEBUG:DCA_DO: entry instrumentation exception", _e)
 
         if sparse_attn_enabled:
             assert slash_indices is not None
@@ -1249,12 +1417,52 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             return output, softmax_lse
             
         if key_states.shape[1] != query_states.shape[1]:
-            # For GQA/MQA, we need to expand key and value heads
-            group_size = query_states.shape[1] // key_states.shape[1]
-            key_states = key_states.unsqueeze(2).repeat(1, 1, group_size, 1).reshape(
-                key_states.shape[0], query_states.shape[1], key_states.shape[2])
-            value_states = value_states.unsqueeze(2).repeat(1, 1, group_size, 1).reshape(
-                value_states.shape[0], query_states.shape[1], value_states.shape[2])
+            # Always-on debug for ROCm DCA bring-up (debug build context)
+            print("DCA_DEBUG:GQA_ENTRY stage=", stage,
+                  " q=", tuple(query_states.shape),
+                  " k=", tuple(key_states.shape),
+                  " v=", tuple(value_states.shape))
+            # For GQA/MQA, only expand when query has MORE heads than KV (standard case)
+            qh = query_states.shape[1]
+            kh = key_states.shape[1]
+            hd_q = query_states.shape[-1]
+            hd_k = key_states.shape[-1]
+            print("DEBUG: GQA/MQA")
+            print("DEBUG: query_states.shape:", query_states.shape)
+            print("DEBUG: key_states.shape:", key_states.shape)
+            if hd_q != hd_k:
+                print("DEBUG: head_dim mismatch inside _do_flash_attn hd_q=", hd_q, " hd_k=", hd_k)
+            if qh > kh:
+                if qh % kh != 0:
+                    print("DEBUG: cannot expand KV (qh not divisible by kh) - abort expansion")
+                else:
+                    group_size = qh // kh
+                    if group_size == 0:
+                        print("DEBUG: computed group_size 0 - skip expansion")
+                    else:
+                        key_states = key_states.unsqueeze(2).repeat(1, 1, group_size, 1).reshape(
+                            key_states.shape[0], qh, key_states.shape[2])
+                        value_states = value_states.unsqueeze(2).repeat(1, 1, group_size, 1).reshape(
+                            value_states.shape[0], qh, value_states.shape[2])
+                        print("DEBUG: expanded KV to match Q heads")
+            elif kh > qh:
+                # Unexpected scenario: more KV heads than query heads; slice to match
+                print("DCA_DEBUG:GQA_KV_GT_Q slicing KV heads from", kh, "to", qh)
+                key_states = key_states[:, :qh, :]
+                value_states = value_states[:, :qh, :]
+            # else equal heads -> no action
+        # Final validation before kernel
+        if (
+            key_states.shape[1] != query_states.shape[1]
+            or value_states.shape[1] != query_states.shape[1]
+            or key_states.shape[-1] != query_states.shape[-1]
+            or value_states.shape[-1] != query_states.shape[-1]
+        ):
+            print("DEBUG: PRE-KERNEL SHAPE FAILURE q=", query_states.shape,
+                  " k=", key_states.shape, " v=", value_states.shape)
+            raise RuntimeError(
+                f"Pre-kernel shape mismatch: q={query_states.shape} k={key_states.shape} v={value_states.shape}"
+            )
         
 
         output = flash_attn_varlen_func(
