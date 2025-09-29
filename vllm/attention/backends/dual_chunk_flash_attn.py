@@ -22,9 +22,9 @@ from vllm.logger import init_logger
 from vllm.utils import async_tensor_h2d
 
 try:
-    from flash_attn import flash_attn_varlen_func, flash_attn_func
+    from flash_attn import flash_attn_varlen_func, flash_attn_func, flash_attn_with_kvcache
     # Use standard flash_attn_func as fallback for specialized functions  
-    flash_attn_with_kvcache = flash_attn_func
+   # flash_attn_with_kvcache = flash_attn_func
     sparse_attn_func = flash_attn_func  # Use standard function as fallback
 except ImportError:
     # Fallback if flash_attn is not available
@@ -69,7 +69,7 @@ class DualChunkFlashAttentionBackend(FlashAttentionBackend):
 @dataclass
 class DualChunkFlashAttentionMetadata(FlashAttentionMetadata):
     # Block size of the paged kv cache.
-    block_size: int = 16
+    block_size: int = 128
 
     # Original max position embeddings.
     original_max_position_embeddings: int = 0
@@ -616,8 +616,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         q_inter=query_inter,
                         q_succ_critical=query_succ_critical,
                         q_inter_critical=query_inter_critical,
-                        k=key_cache,
-                        v=value_cache,
+                        k=key,
+                        v=value,
                         cu_seqlens_q=prefill_meta.query_start_loc,
                         cu_seqlens_k=prefill_meta.seq_start_loc,
                         orig_seq_lens=prefill_meta.orig_seq_lens,
@@ -680,35 +680,38 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         print(f"DEBUG:DCA_PREFILL_ENTRY: q.shape={q.shape} q_succ.shape={q_succ.shape}")
         print(f"DEBUG:DCA_PREFILL_ENTRY: cu_seqlens_q={cu_seqlens_q} cu_seqlens_k={cu_seqlens_k}")
         
-        # Fix tensor shapes: convert 5D cache tensors to expected 3D format
-        # Expected format: [seq_len, num_kv_heads, head_dim]
-        # For this GQA model: num_kv_heads=1, head_dim=128
-        if k.dim() == 5:
-            # k has shape [seq_len, 1, 16, 16, 8] for this model
-            # For GQA with 1 KV head, reshape to [seq_len, 1, 128]
-            seq_len = k.shape[0]
-            k = k.view(seq_len, 1, -1)  # Flatten everything after seq_len
-            if k.shape[2] > 128:
-                # Take first 128 dims if head_dim is larger 
-                k = k[:, :, :128]
-            print(f"DEBUG:DCA_PREFILL_ENTRY: Reshaped k from 5D to {k.shape}")
+        # Ensure k and v are in the expected 3D format for flash attention
+        if k.dim() != 3:
+            raise ValueError(f"Expected k to be 3D tensor [seq_len, num_kv_heads, head_dim], got shape {k.shape}")
+        if v.dim() != 3:
+            raise ValueError(f"Expected v to be 3D tensor [seq_len, num_kv_heads, head_dim], got shape {v.shape}")
+        
+        # For GQA: expand KV heads to match query heads for flash attention compatibility
+        # k.shape=[seq_len, 1, head_dim] -> [seq_len, 8, head_dim] 
+        # v.shape=[seq_len, 1, head_dim] -> [seq_len, 8, head_dim]
+        if k.shape[1] != q.shape[1]:  # num_kv_heads != num_heads (GQA case)
+            num_heads = q.shape[1]  # 8
+            num_kv_heads = k.shape[1]  # 1
+            repeat_factor = num_heads // num_kv_heads  # 8
             
-        if v.dim() == 5:
-            # v has shape [seq_len, 1, 128, 16] 
-            seq_len = v.shape[0]
-            v = v.view(seq_len, 1, -1)  # Flatten to get head_dim
-            if v.shape[2] > 128:
-                # Take first 128 dims
-                v = v[:, :, :128]
-            print(f"DEBUG:DCA_PREFILL_ENTRY: Reshaped v from 5D to {v.shape}")
-        elif v.dim() == 4:
-            # v has shape [seq_len, 1, 128, 16]
-            seq_len = v.shape[0]
-            v = v.view(seq_len, 1, -1)  # Flatten to [seq_len, 1, head_dim]
-            if v.shape[2] > 128:
-                # Take first 128 dims  
-                v = v[:, :, :128]
-            print(f"DEBUG:DCA_PREFILL_ENTRY: Reshaped v from 4D to {v.shape}")
+            # Expand KV tensors to match query heads
+            k = k.repeat_interleave(repeat_factor, dim=1)
+            v = v.repeat_interleave(repeat_factor, dim=1)
+            
+            print(f"DEBUG:DCA_PREFILL_ENTRY: Expanded k from {k.shape[0], num_kv_heads, k.shape[2]} to {k.shape}")
+            print(f"DEBUG:DCA_PREFILL_ENTRY: Expanded v from {v.shape[0], num_kv_heads, v.shape[2]} to {v.shape}")
+        
+        print(f"DEBUG:DCA_PREFILL_ENTRY: Final k.shape={k.shape} v.shape={v.shape}")
+            
+        # Validate dimensions match expected format
+        if k.shape != v.shape:
+            raise ValueError(f"Key and value shapes must match: k.shape={k.shape}, v.shape={v.shape}")
+            
+        # Verify sequence lengths match query
+        if k.shape[0] != q.shape[0]:
+            # For prefill, k/v should contain all tokens in the sequence, not just current batch
+            print(f"DEBUG:DCA_PREFILL_ENTRY: Sequence length mismatch: k.shape[0]={k.shape[0]}, q.shape[0]={q.shape[0]}")
+            # This is expected in prefill mode where k/v may contain cached data
         
         if alibi_slopes is not None:
             raise ValueError(
@@ -1621,8 +1624,48 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         lse_s = torch.exp(stable_logits).detach()
         lse_sum = torch.sum(lse_s, dim=0)
         lse_s /= lse_sum
-        outputs *= lse_s.unsqueeze(-1).transpose(2, 3)
-        return outputs.sum(0)
+        # DEBUG: shape diagnostics before weighting merge
+        try:  # pragma: no cover
+            print("DEBUG:DCA_DECODE_MERGE: outputs.shape=", outputs.shape,
+                  " softmax_lses.shape=", softmax_lses.shape,
+                  " lse_s.shape=", lse_s.shape)
+        except Exception:
+            pass
+        # Expected shapes:
+        #   outputs: [N_CTX_TYPES, B, H, S_q, D]
+        #   lse_s:   [N_CTX_TYPES, B, H, S_q]
+        # Current code earlier produced outputs of shape [N_CTX_TYPES, B, H, D] (missing S_q) or [N_CTX_TYPES, B, S_q, H, D].
+        # Normalize to a canonical 5D before weighting.
+        if outputs.dim() == 4:
+            # Assume shape [N_TYPES, B, H, D] with S_q == 1
+            outputs = outputs.unsqueeze(3)  # -> [N_TYPES, B, H, 1, D]
+        elif outputs.dim() == 5:
+            pass
+        else:
+            raise RuntimeError(f"Unexpected outputs.dim()={outputs.dim()} in merge phase")
+        if lse_s.dim() == 3:
+            # lse_s: [N_TYPES, B, H] => add S_q dimension (=1)
+            lse_s = lse_s.unsqueeze(-1)
+        elif lse_s.dim() == 4:
+            pass
+        else:
+            raise RuntimeError(f"Unexpected lse_s.dim()={lse_s.dim()} in merge phase")
+        # Broadcast weighting across feature dim D
+        # outputs: [N_TYPES, B, H, S_q, D]
+        # lse_s:   [N_TYPES, B, H, S_q]
+        weighting = lse_s.unsqueeze(-1)  # [N_TYPES, B, H, S_q, 1]
+        outputs = outputs * weighting
+        # DEBUG after weighting
+        try:  # pragma: no cover
+            print("DEBUG:DCA_DECODE_MERGE_POST: weighted outputs.shape=", outputs.shape)
+        except Exception:
+            pass
+        # Reduce over context type dimension
+        outputs = outputs.sum(0)  # -> [B, H, S_q, D]
+        # If S_q == 1, squeeze to match original expectation
+        if outputs.shape[2] == 1:
+            outputs = outputs.squeeze(2)  # [B, H, D]
+        return outputs
 
     def _dual_chunk_flash_attn_decoding_with_exp_sums(
         self,
@@ -1635,10 +1678,67 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         alibi_slopes: Optional[torch.Tensor],
         causal: bool,
     ):
+        # Adapt the internal paged_attn cache layout to the layout expected by
+        # flash_attn_with_kvcache.
+        # paged_attn stores:
+        #   key_cache:  [num_blocks, num_kv_heads, head_size//x, block_size, x]
+        #   value_cache:[num_blocks, num_kv_heads, head_size, block_size]
+        # flash_attn_with_kvcache expects (per its other backends usage):
+        #   key_cache:  [num_blocks, block_size, num_kv_heads, head_size]
+        #   value_cache:[num_blocks, block_size, num_kv_heads, head_size]
+        # Where block_size must be divisible by 128.
+        # We only perform the transpose+view if shapes indicate the paged layout.
+        try:  # pragma: no cover - debug / safe guard
+            original_key_shape = tuple(key_cache.shape)
+            original_value_shape = tuple(value_cache.shape)
+            print(f"DEBUG:DCA_DECODE: raw key_cache.shape={original_key_shape} value_cache.shape={original_value_shape}")
+        except Exception:
+            pass
+
+        # Transform key_cache if in 5D paged_attn layout
+        if key_cache.dim() == 5:
+            # (B, H_kv, Hd_div_x, block, x)
+            nb, n_kv, hd_div_x, blk, x = key_cache.shape
+            head_size = hd_div_x * x
+            # Rearrange to (B, blk, n_kv, head_size)
+            key_cache_for_fa = (
+                key_cache.permute(0, 3, 1, 2, 4)  # B, blk, H_kv, Hd_div_x, x
+                .contiguous()
+                .view(nb, blk, n_kv, head_size)
+            )
+        else:
+            key_cache_for_fa = key_cache
+
+        # Transform value_cache if in 4D paged_attn layout (B, H_kv, Hd, blk)
+        if value_cache.dim() == 4 and value_cache.shape[1] <= 512 and value_cache.shape[-1] < 2048:
+            # Heuristic: interpret last dim as block_size
+            vb, n_kv_val, head_size_val, blk_val = value_cache.shape
+            value_cache_for_fa = (
+                value_cache.permute(0, 3, 1, 2)  # B, blk, H_kv, Hd
+                .contiguous()
+            )
+            # Sanity: ensure head sizes align if both transformed
+            if key_cache_for_fa is not key_cache:
+                assert key_cache_for_fa.shape[2] == n_kv_val, (
+                    f"KV heads mismatch after transform: key {key_cache_for_fa.shape}, value {value_cache_for_fa.shape}")
+                assert key_cache_for_fa.shape[3] == head_size_val, (
+                    f"Head dim mismatch after transform: key {key_cache_for_fa.shape}, value {value_cache_for_fa.shape}")
+        else:
+            value_cache_for_fa = value_cache
+
+        # Extract block_size for debug (2nd dim after transform)
+        try:  # pragma: no cover
+            blk_size_debug = key_cache_for_fa.shape[1] if key_cache_for_fa.dim() >= 2 else None
+            print(
+                f"DEBUG:DCA_DECODE: transformed key_cache.shape={tuple(key_cache_for_fa.shape)} value_cache.shape={tuple(value_cache_for_fa.shape)} block_size={blk_size_debug}")
+        except Exception:
+            pass
+
+        # Call flash attention with transformed caches
         out = flash_attn_with_kvcache(
             q=query,
-            k_cache=key_cache,
-            v_cache=value_cache,
+            k_cache=key_cache_for_fa,
+            v_cache=value_cache_for_fa,
             block_table=block_table,
             cache_seqlens=cache_seqlens,
             softmax_scale=softmax_scale,
