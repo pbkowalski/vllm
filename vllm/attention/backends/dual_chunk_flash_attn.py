@@ -1427,7 +1427,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         except Exception as e:
             print(f"DEBUG:PRE_KERNEL_INPUT exception: {e}")
 
-        output = flash_attn_varlen_func(
+        output, softmax_lse, _ = flash_attn_varlen_func(
             q=query_states,
             k=key_states,
             v=value_states,
@@ -1441,6 +1441,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                                       device=query_states.device),
             max_seqlen_k=max_seqlen_k,
             causal=causal,
+            return_attn_probs = True,
         )
         
         # Log output tensor statistics after kernel call
@@ -1458,7 +1459,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         
         # Generate dummy softmax_lse for merging - this is a simplified approach
         # In practice, we would need a more sophisticated merging strategy
-        softmax_lse = torch.zeros((1, q_heads, q_len), device=query_states.device, dtype=torch.float32)
+        #softmax_lse = torch.zeros((1, q_heads, q_len), device=query_states.device, dtype=torch.float32)
         
         try:
             print(f"DEBUG:  softmax_lse: shape={tuple(softmax_lse.shape)} (dummy zeros)")
@@ -1501,7 +1502,11 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             lse_s = torch.exp(stable_logits).detach()
             lse_sum = torch.sum(lse_s, dim=0)
             lse_s /= lse_sum
-            attn_outputs *= lse_s.unsqueeze(-1).transpose(2, 3).squeeze(1)
+            print("debug:MERGE: attn_outputs.shape=", attn_outputs.shape, "lse_s.shape=", lse_s.shape)
+            #attn_outputs *= lse_s.unsqueeze(-1).transpose(2, 3).squeeze(1)
+            lse_s_reshaped = lse_s.transpose(1, 2).unsqueeze(-1)  # [num_chunks, seq_len, num_heads, 1]
+            print("debug:MERGE: after reshape lse_s_reshaped.shape=", lse_s_reshaped.shape)
+            attn_outputs *= lse_s_reshaped
             attn_outputs_all.append(attn_outputs.sum(dim=0))
 
         if return_lse:
