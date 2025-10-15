@@ -21,17 +21,10 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils import async_tensor_h2d
 
-try:
-    from flash_attn import flash_attn_varlen_func, flash_attn_func, flash_attn_with_kvcache
-    # Use standard flash_attn_func as fallback for specialized functions  
-   # flash_attn_with_kvcache = flash_attn_func
-    sparse_attn_func = flash_attn_func  # Use standard function as fallback
-except ImportError:
-    # Fallback if flash_attn is not available
-    flash_attn_varlen_func = None
-    flash_attn_func = None
-    flash_attn_with_kvcache = None
-    sparse_attn_func = None
+from flash_attn import flash_attn_varlen_func, flash_attn_func, flash_attn_with_kvcache
+# Use standard flash_attn_func as fallback for specialized functions  
+# flash_attn_with_kvcache = flash_attn_func
+sparse_attn_func = flash_attn_func  # Use standard function as fallback
 
 
 
@@ -680,38 +673,38 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         print(f"DEBUG:DCA_PREFILL_ENTRY: q.shape={q.shape} q_succ.shape={q_succ.shape}")
         print(f"DEBUG:DCA_PREFILL_ENTRY: cu_seqlens_q={cu_seqlens_q} cu_seqlens_k={cu_seqlens_k}")
         
-        # Ensure k and v are in the expected 3D format for flash attention
-        if k.dim() != 3:
-            raise ValueError(f"Expected k to be 3D tensor [seq_len, num_kv_heads, head_dim], got shape {k.shape}")
-        if v.dim() != 3:
-            raise ValueError(f"Expected v to be 3D tensor [seq_len, num_kv_heads, head_dim], got shape {v.shape}")
+        # # Ensure k and v are in the expected 3D format for flash attention
+        # if k.dim() != 3:
+        #     raise ValueError(f"Expected k to be 3D tensor [seq_len, num_kv_heads, head_dim], got shape {k.shape}")
+        # if v.dim() != 3:
+        #     raise ValueError(f"Expected v to be 3D tensor [seq_len, num_kv_heads, head_dim], got shape {v.shape}")
         
         # For GQA: expand KV heads to match query heads for flash attention compatibility
         # k.shape=[seq_len, 1, head_dim] -> [seq_len, 8, head_dim] 
         # v.shape=[seq_len, 1, head_dim] -> [seq_len, 8, head_dim]
-        if k.shape[1] != q.shape[1]:  # num_kv_heads != num_heads (GQA case)
-            num_heads = q.shape[1]  # 8
-            num_kv_heads = k.shape[1]  # 1
-            repeat_factor = num_heads // num_kv_heads  # 8
+        # if k.shape[1] != q.shape[1]:  # num_kv_heads != num_heads (GQA case)
+        #     num_heads = q.shape[1]  # 8
+        #     num_kv_heads = k.shape[1]  # 1
+        #     repeat_factor = num_heads // num_kv_heads  # 8
             
-            # Expand KV tensors to match query heads
-            k = k.repeat_interleave(repeat_factor, dim=1)
-            v = v.repeat_interleave(repeat_factor, dim=1)
+        #     # Expand KV tensors to match query heads
+        #     k = k.repeat_interleave(repeat_factor, dim=1)
+        #     v = v.repeat_interleave(repeat_factor, dim=1)
             
-            print(f"DEBUG:DCA_PREFILL_ENTRY: Expanded k from {k.shape[0], num_kv_heads, k.shape[2]} to {k.shape}")
-            print(f"DEBUG:DCA_PREFILL_ENTRY: Expanded v from {v.shape[0], num_kv_heads, v.shape[2]} to {v.shape}")
+        #     print(f"DEBUG:DCA_PREFILL_ENTRY: Expanded k from {k.shape[0], num_kv_heads, k.shape[2]} to {k.shape}")
+        #     print(f"DEBUG:DCA_PREFILL_ENTRY: Expanded v from {v.shape[0], num_kv_heads, v.shape[2]} to {v.shape}")
         
-        print(f"DEBUG:DCA_PREFILL_ENTRY: Final k.shape={k.shape} v.shape={v.shape}")
+        # print(f"DEBUG:DCA_PREFILL_ENTRY: Final k.shape={k.shape} v.shape={v.shape}")
             
-        # Validate dimensions match expected format
-        if k.shape != v.shape:
-            raise ValueError(f"Key and value shapes must match: k.shape={k.shape}, v.shape={v.shape}")
+        # # Validate dimensions match expected format
+        # if k.shape != v.shape:
+        #     raise ValueError(f"Key and value shapes must match: k.shape={k.shape}, v.shape={v.shape}")
             
-        # Verify sequence lengths match query
-        if k.shape[0] != q.shape[0]:
-            # For prefill, k/v should contain all tokens in the sequence, not just current batch
-            print(f"DEBUG:DCA_PREFILL_ENTRY: Sequence length mismatch: k.shape[0]={k.shape[0]}, q.shape[0]={q.shape[0]}")
-            # This is expected in prefill mode where k/v may contain cached data
+        # # Verify sequence lengths match query
+        # if k.shape[0] != q.shape[0]:
+        #     # For prefill, k/v should contain all tokens in the sequence, not just current batch
+        #     print(f"DEBUG:DCA_PREFILL_ENTRY: Sequence length mismatch: k.shape[0]={k.shape[0]}, q.shape[0]={q.shape[0]}")
+        #     # This is expected in prefill mode where k/v may contain cached data
         
         if alibi_slopes is not None:
             raise ValueError(
@@ -748,7 +741,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             current_q_succ_critical = q_succ_critical[qs:qe]
             current_q_inter_critical = q_inter_critical[qs:qe]
 
-            if block_table is None:
+            if True or block_table is None:
                 current_k = k[ks:ke]
                 current_v = v[ks:ke]
                 current_block_table = None
@@ -832,32 +825,20 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         current_q_succ_critical[:, head_id, :].unsqueeze(1)
                     current_q_inter_head_critical = \
                         current_q_inter_critical[:, head_id, :].unsqueeze(1)
-                    if block_table is not None:
-                        # For GQA, reuse the single KV head instead of slicing
-                        if self.num_queries_per_kv > 1:  # GQA case
-                            current_k_head = current_k.unsqueeze(2)  # [seq_len, num_kv_heads, head_dim] -> [seq_len, num_kv_heads, head_dim, 1]
-                            current_v_head = current_v.unsqueeze(2)  # [seq_len, num_kv_heads, head_dim] -> [seq_len, num_kv_heads, head_dim, 1]
-                        else:  # MHA case
-                            current_k_head = current_k[..., head_id //
-                                                       group_size, :].unsqueeze(2)
-                            current_v_head = current_v[..., head_id //
-                                                       group_size, :].unsqueeze(2)
-                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: block_table case head_id={head_id} group_size={group_size} gqa={self.num_queries_per_kv > 1}")
-                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_k_head.shape={current_k_head.shape}")
-                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_v_head.shape={current_v_head.shape}")
-                    else:
-                        # For GQA, reuse the single KV head instead of slicing
-                        if self.num_queries_per_kv > 1:  # GQA case
-                            current_k_head = current_k  # [seq_len, num_kv_heads, head_dim] stays as is
-                            current_v_head = current_v  # [seq_len, num_kv_heads, head_dim] stays as is
-                        else:  # MHA case
-                            current_k_head = current_k[:, head_id //
-                                                       group_size, :].unsqueeze(1)
-                            current_v_head = current_v[:, head_id //
-                                                       group_size, :].unsqueeze(1)
-                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: non-block case head_id={head_id} group_size={group_size} gqa={self.num_queries_per_kv > 1}")
-                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_k_head.shape={current_k_head.shape}")
-                        print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_v_head.shape={current_v_head.shape}")
+                    # if block_table is not None:
+                    #     current_k_head = current_k[..., head_id //
+                    #                                group_size, :].unsqueeze(2)
+                    #     current_v_head = current_v[..., head_id //
+                    #                                group_size, :].unsqueeze(2)
+
+                    # else:
+                    current_k_head = current_k[:, head_id //
+                                               group_size, :].unsqueeze(1)
+                    current_v_head = current_v[:, head_id //
+                                               group_size, :].unsqueeze(1)
+                    print(f"DEBUG:DCA_PREFILL_PER_HEAD: non-block case head_id={head_id} group_size={group_size} gqa={self.num_queries_per_kv > 1}")
+                    print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_k_head.shape={current_k_head.shape}")
+                    print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_v_head.shape={current_v_head.shape}")
 
                     current_out = self._dual_chunk_flash_attn_prefill_func(
                         current_q_head,
@@ -1350,19 +1331,19 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         q_len = query_states.shape[0]
         q_heads = query_states.shape[1]
         h_dim = query_states.shape[-1]
-        try:
-            prod_q = q_heads * h_dim
-            prod_k = key_states.shape[1] * key_states.shape[-1]
-            print("DEBUG:DCA_DO: entry stage=", stage, " q=", query_states.shape,
-                  " k=", key_states.shape, " v=", value_states.shape,
-                  " q_heads*dim=", prod_q, " k_heads*dim=", prod_k,
-                  " causal=", causal, " sparse=", sparse_attn_enabled)
-            if q_heads == 1 and key_states.shape[1] > 1 and prod_q == prod_k:
-                print("DEBUG:DCA_DO: DETECTED_INVERTED_GQA q has aggregated head, k split into more heads (k_heads=", key_states.shape[1], ")")
-            if key_states.shape[-1] != h_dim and prod_q == prod_k:
-                print("DEBUG:DCA_DO: per-head dim mismatch but total fused dimension matches; likely head factoring difference")
-        except Exception as _e:
-            print("DEBUG:DCA_DO: entry instrumentation exception", _e)
+        # try:
+        #     prod_q = q_heads * h_dim
+        #     prod_k = key_states.shape[1] * key_states.shape[-1]
+        #     print("DEBUG:DCA_DO: entry stage=", stage, " q=", query_states.shape,
+        #           " k=", key_states.shape, " v=", value_states.shape,
+        #           " q_heads*dim=", prod_q, " k_heads*dim=", prod_k,
+        #           " causal=", causal, " sparse=", sparse_attn_enabled)
+        #     if q_heads == 1 and key_states.shape[1] > 1 and prod_q == prod_k:
+        #         print("DEBUG:DCA_DO: DETECTED_INVERTED_GQA q has aggregated head, k split into more heads (k_heads=", key_states.shape[1], ")")
+        #     if key_states.shape[-1] != h_dim and prod_q == prod_k:
+        #         print("DEBUG:DCA_DO: per-head dim mismatch but total fused dimension matches; likely head factoring difference")
+        # except Exception as _e:
+        #     print("DEBUG:DCA_DO: entry instrumentation exception", _e)
 
         if sparse_attn_enabled:
             assert slash_indices is not None
@@ -1411,62 +1392,40 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 res = res.view(q_len, q_heads, h_dim)
                 s_lse = s_lse.view(q_len, q_heads, 1).transpose(0, 2).float()
             return res, s_lse
-        # Handle GQA/MQA by expanding key/value heads to match query heads
-        if key_states.numel() == 0 or value_states.numel() == 0:
-            # Handle empty tensor case - return empty output with correct shape
-            output = torch.empty(query_states.shape[0], query_states.shape[1], query_states.shape[2], 
-                               dtype=query_states.dtype, device=query_states.device)
-            softmax_lse = torch.zeros((1, q_heads, q_len), device=query_states.device, dtype=torch.float32)
-            return output, softmax_lse
-            
-        if key_states.shape[1] != query_states.shape[1]:
-            # Always-on debug for ROCm DCA bring-up (debug build context)
-            print("DCA_DEBUG:GQA_ENTRY stage=", stage,
-                  " q=", tuple(query_states.shape),
-                  " k=", tuple(key_states.shape),
-                  " v=", tuple(value_states.shape))
-            # For GQA/MQA, only expand when query has MORE heads than KV (standard case)
-            qh = query_states.shape[1]
-            kh = key_states.shape[1]
-            hd_q = query_states.shape[-1]
-            hd_k = key_states.shape[-1]
-            print("DEBUG: GQA/MQA")
-            print("DEBUG: query_states.shape:", query_states.shape)
-            print("DEBUG: key_states.shape:", key_states.shape)
-            if hd_q != hd_k:
-                print("DEBUG: head_dim mismatch inside _do_flash_attn hd_q=", hd_q, " hd_k=", hd_k)
-            if qh > kh:
-                if qh % kh != 0:
-                    print("DEBUG: cannot expand KV (qh not divisible by kh) - abort expansion")
-                else:
-                    group_size = qh // kh
-                    if group_size == 0:
-                        print("DEBUG: computed group_size 0 - skip expansion")
-                    else:
-                        key_states = key_states.unsqueeze(2).repeat(1, 1, group_size, 1).reshape(
-                            key_states.shape[0], qh, key_states.shape[2])
-                        value_states = value_states.unsqueeze(2).repeat(1, 1, group_size, 1).reshape(
-                            value_states.shape[0], qh, value_states.shape[2])
-                        print("DEBUG: expanded KV to match Q heads")
-            elif kh > qh:
-                # Unexpected scenario: more KV heads than query heads; slice to match
-                print("DCA_DEBUG:GQA_KV_GT_Q slicing KV heads from", kh, "to", qh)
-                key_states = key_states[:, :qh, :]
-                value_states = value_states[:, :qh, :]
-            # else equal heads -> no action
-        # Final validation before kernel
-        if (
-            key_states.shape[1] != query_states.shape[1]
-            or value_states.shape[1] != query_states.shape[1]
-            or key_states.shape[-1] != query_states.shape[-1]
-            or value_states.shape[-1] != query_states.shape[-1]
-        ):
-            print("DEBUG: PRE-KERNEL SHAPE FAILURE q=", query_states.shape,
-                  " k=", key_states.shape, " v=", value_states.shape)
-            raise RuntimeError(
-                f"Pre-kernel shape mismatch: q={query_states.shape} k={key_states.shape} v={value_states.shape}"
-            )
+
+        # if key_states.numel() == 0 or value_states.numel() == 0:
+        #     # Handle empty tensor case - return empty output with correct shape
+        #     output = torch.empty(query_states.shape[0], query_states.shape[1], query_states.shape[2], 
+        #                        dtype=query_states.dtype, device=query_states.device)
+        #     softmax_lse = torch.zeros((1, q_heads, q_len), device=query_states.device, dtype=torch.float32)
+        #     return output, softmax_lse
         
+        # Log input tensor statistics before kernel call
+        try:
+            q_norm = torch.linalg.vector_norm(query_states.float()).item()
+            k_norm = torch.linalg.vector_norm(key_states.float()).item()
+            v_norm = torch.linalg.vector_norm(value_states.float()).item()
+            q_has_nan = torch.isnan(query_states).any().item()
+            q_has_inf = torch.isinf(query_states).any().item()
+            k_has_nan = torch.isnan(key_states).any().item()
+            k_has_inf = torch.isinf(key_states).any().item()
+            v_has_nan = torch.isnan(value_states).any().item()
+            v_has_inf = torch.isinf(value_states).any().item()
+            q_min = query_states.min().item()
+            q_max = query_states.max().item()
+            k_min = key_states.min().item()
+            k_max = key_states.max().item()
+            v_min = value_states.min().item()
+            v_max = value_states.max().item()
+            print(f"DEBUG:PRE_KERNEL_INPUT stage={stage} causal={causal} softmax_scale={softmax_scale}")
+            print(f"DEBUG:  query_states: shape={tuple(query_states.shape)} norm={q_norm:.6f} "
+                  f"nan={q_has_nan} inf={q_has_inf} min={q_min:.6f} max={q_max:.6f}")
+            print(f"DEBUG:  key_states: shape={tuple(key_states.shape)} norm={k_norm:.6f} "
+                  f"nan={k_has_nan} inf={k_has_inf} min={k_min:.6f} max={k_max:.6f}")
+            print(f"DEBUG:  value_states: shape={tuple(value_states.shape)} norm={v_norm:.6f} "
+                  f"nan={v_has_nan} inf={v_has_inf} min={v_min:.6f} max={v_max:.6f}")
+        except Exception as e:
+            print(f"DEBUG:PRE_KERNEL_INPUT exception: {e}")
 
         output = flash_attn_varlen_func(
             q=query_states,
@@ -1483,9 +1442,29 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             max_seqlen_k=max_seqlen_k,
             causal=causal,
         )
+        
+        # Log output tensor statistics after kernel call
+        try:
+            out_norm = torch.linalg.vector_norm(output.float()).item()
+            out_has_nan = torch.isnan(output).any().item()
+            out_has_inf = torch.isinf(output).any().item()
+            out_min = output.min().item()
+            out_max = output.max().item()
+            print(f"DEBUG:POST_KERNEL_OUTPUT stage={stage}")
+            print(f"DEBUG:  output: shape={tuple(output.shape)} norm={out_norm:.6f} "
+                  f"nan={out_has_nan} inf={out_has_inf} min={out_min:.6f} max={out_max:.6f}")
+        except Exception as e:
+            print(f"DEBUG:POST_KERNEL_OUTPUT exception: {e}")
+        
         # Generate dummy softmax_lse for merging - this is a simplified approach
         # In practice, we would need a more sophisticated merging strategy
         softmax_lse = torch.zeros((1, q_heads, q_len), device=query_states.device, dtype=torch.float32)
+        
+        try:
+            print(f"DEBUG:  softmax_lse: shape={tuple(softmax_lse.shape)} (dummy zeros)")
+        except Exception as e:
+            print(f"DEBUG:SOFTMAX_LSE logging exception: {e}")
+        
         return output, softmax_lse
 
     def _merge_attn_outputs(
