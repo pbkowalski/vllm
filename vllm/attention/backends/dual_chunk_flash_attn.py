@@ -1462,7 +1462,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         #softmax_lse = torch.zeros((1, q_heads, q_len), device=query_states.device, dtype=torch.float32)
         
         try:
-            print(f"DEBUG:  softmax_lse: shape={tuple(softmax_lse.shape)} (dummy zeros)")
+            print(f"DEBUG:  softmax_lse: shape={tuple(softmax_lse.shape)}")
         except Exception as e:
             print(f"DEBUG:SOFTMAX_LSE logging exception: {e}")
         
@@ -1608,48 +1608,16 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         lse_s = torch.exp(stable_logits).detach()
         lse_sum = torch.sum(lse_s, dim=0)
         lse_s /= lse_sum
-        # DEBUG: shape diagnostics before weighting merge
-        try:  # pragma: no cover
-            print("DEBUG:DCA_DECODE_MERGE: outputs.shape=", outputs.shape,
-                  " softmax_lses.shape=", softmax_lses.shape,
-                  " lse_s.shape=", lse_s.shape)
-        except Exception:
-            pass
-        # Expected shapes:
-        #   outputs: [N_CTX_TYPES, B, H, S_q, D]
-        #   lse_s:   [N_CTX_TYPES, B, H, S_q]
-        # Current code earlier produced outputs of shape [N_CTX_TYPES, B, H, D] (missing S_q) or [N_CTX_TYPES, B, S_q, H, D].
-        # Normalize to a canonical 5D before weighting.
-        if outputs.dim() == 4:
-            # Assume shape [N_TYPES, B, H, D] with S_q == 1
-            outputs = outputs.unsqueeze(3)  # -> [N_TYPES, B, H, 1, D]
-        elif outputs.dim() == 5:
-            pass
-        else:
-            raise RuntimeError(f"Unexpected outputs.dim()={outputs.dim()} in merge phase")
-        if lse_s.dim() == 3:
-            # lse_s: [N_TYPES, B, H] => add S_q dimension (=1)
-            lse_s = lse_s.unsqueeze(-1)
-        elif lse_s.dim() == 4:
-            pass
-        else:
-            raise RuntimeError(f"Unexpected lse_s.dim()={lse_s.dim()} in merge phase")
-        # Broadcast weighting across feature dim D
-        # outputs: [N_TYPES, B, H, S_q, D]
-        # lse_s:   [N_TYPES, B, H, S_q]
-        weighting = lse_s.unsqueeze(-1)  # [N_TYPES, B, H, S_q, 1]
-        outputs = outputs * weighting
-        # DEBUG after weighting
-        try:  # pragma: no cover
-            print("DEBUG:DCA_DECODE_MERGE_POST: weighted outputs.shape=", outputs.shape)
-        except Exception:
-            pass
-        # Reduce over context type dimension
-        outputs = outputs.sum(0)  # -> [B, H, S_q, D]
-        # If S_q == 1, squeeze to match original expectation
-        if outputs.shape[2] == 1:
-            outputs = outputs.squeeze(2)  # [B, H, D]
-        return outputs
+        print("DEBUG:DCA_DECODE_MERGE: outputs.shape=", outputs.shape,
+      " softmax_lses.shape=", softmax_lses.shape,
+      " lse_s.shape=", lse_s.shape)
+        lse_s=lse_s.transpose(-1, -2).unsqueeze(-1)  # [num_chunks, seq_len, num_heads]
+        print("DEBUG:DCA_DECODE_MERGE: reshaped lse_s", lse_s.shape)
+        outputs *= lse_s
+
+        return outputs.sum(0)
+
+
 
     def _dual_chunk_flash_attn_decoding_with_exp_sums(
         self,
@@ -1668,69 +1636,43 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         #   key_cache:  [num_blocks, num_kv_heads, head_size//x, block_size, x]
         #   value_cache:[num_blocks, num_kv_heads, head_size, block_size]
         # flash_attn_with_kvcache expects (per its other backends usage):
-        #   key_cache:  [num_blocks, block_size, num_kv_heads, head_size]
+        #   key_cache:  [num_blocks, block_size, num_kv_heads, num_query_heads]
         #   value_cache:[num_blocks, block_size, num_kv_heads, head_size]
-        # Where block_size must be divisible by 128.
-        # We only perform the transpose+view if shapes indicate the paged layout.
+
         try:  # pragma: no cover - debug / safe guard
             original_key_shape = tuple(key_cache.shape)
             original_value_shape = tuple(value_cache.shape)
             print(f"DEBUG:DCA_DECODE: raw key_cache.shape={original_key_shape} value_cache.shape={original_value_shape}")
         except Exception:
             pass
-
-        # Transform key_cache if in 5D paged_attn layout
-        if key_cache.dim() == 5:
-            # (B, H_kv, Hd_div_x, block, x)
-            nb, n_kv, hd_div_x, blk, x = key_cache.shape
-            head_size = hd_div_x * x
-            # Rearrange to (B, blk, n_kv, head_size)
-            key_cache_for_fa = (
-                key_cache.permute(0, 3, 1, 2, 4)  # B, blk, H_kv, Hd_div_x, x
-                .contiguous()
-                .view(nb, blk, n_kv, head_size)
-            )
-        else:
-            key_cache_for_fa = key_cache
-
-        # Transform value_cache if in 4D paged_attn layout (B, H_kv, Hd, blk)
-        if value_cache.dim() == 4 and value_cache.shape[1] <= 512 and value_cache.shape[-1] < 2048:
-            # Heuristic: interpret last dim as block_size
-            vb, n_kv_val, head_size_val, blk_val = value_cache.shape
-            value_cache_for_fa = (
-                value_cache.permute(0, 3, 1, 2)  # B, blk, H_kv, Hd
-                .contiguous()
-            )
-            # Sanity: ensure head sizes align if both transformed
-            if key_cache_for_fa is not key_cache:
-                assert key_cache_for_fa.shape[2] == n_kv_val, (
-                    f"KV heads mismatch after transform: key {key_cache_for_fa.shape}, value {value_cache_for_fa.shape}")
-                assert key_cache_for_fa.shape[3] == head_size_val, (
-                    f"Head dim mismatch after transform: key {key_cache_for_fa.shape}, value {value_cache_for_fa.shape}")
-        else:
-            value_cache_for_fa = value_cache
-
-        # Extract block_size for debug (2nd dim after transform)
-        try:  # pragma: no cover
-            blk_size_debug = key_cache_for_fa.shape[1] if key_cache_for_fa.dim() >= 2 else None
-            print(
-                f"DEBUG:DCA_DECODE: transformed key_cache.shape={tuple(key_cache_for_fa.shape)} value_cache.shape={tuple(value_cache_for_fa.shape)} block_size={blk_size_debug}")
-        except Exception:
-            pass
-
         # Call flash attention with transformed caches
-        out = flash_attn_with_kvcache(
+        # Reshape key_cache from [num_blocks, num_kv_heads, head_size//x, block_size, x]
+        # to [num_blocks, block_size, num_kv_heads, head_size]
+        key_cache_fa = key_cache.transpose(2,3).transpose(1,2).flatten(-2).contiguous()
+        # Reshape value_cache from [num_blocks, num_kv_heads, head_size, block_size]
+        # to [num_blocks, block_size, num_kv_heads, head_size]
+        value_cache_fa = value_cache.transpose(2,3).transpose(1,2).contiguous()
+        print(f"DEBUG:DCA_DECODE: reshaped key_cache.shape={key_cache_fa.shape} value_cache.shape={value_cache_fa.shape}, "
+              f"contiguous: {key_cache_fa.is_contiguous()} {value_cache_fa.is_contiguous()}, "
+              f"last_dim_stride: {key_cache_fa.stride(-1)}, {value_cache_fa.stride(-1)}")
+
+        out, softmax_lse = flash_attn_with_kvcache(
             q=query,
-            k_cache=key_cache_for_fa,
-            v_cache=value_cache_for_fa,
+            k_cache=key_cache_fa,
+            v_cache=value_cache_fa,
             block_table=block_table,
             cache_seqlens=cache_seqlens,
             softmax_scale=softmax_scale,
             alibi_slopes=alibi_slopes,
             causal=causal,
+            return_softmax_lse=True,
         )
         # Generate dummy softmax_lse for compatibility
-        softmax_lse = torch.zeros((out.shape[0], out.shape[1], out.shape[2]), device=out.device, dtype=torch.float32)
+        #softmax_lse = torch.zeros((out.shape[0], out.shape[1], out.shape[2]), device=out.device, dtype=torch.float32)
+        # cache_seqlens is 0 when there is no valid key/value to attend to, proportion is:
+        cache_seqlens_eq0_ratio = (cache_seqlens == 0).float().mean().item()
+        print("DEBUG:DCA_DECODE: out.shape=", out.shape,
+              f" ratio_cache_seqlens_eq0={cache_seqlens_eq0_ratio:.6f}")
         mask = (cache_seqlens == 0)
         out[mask] = 0
         softmax_lse[mask] = -float("inf")
