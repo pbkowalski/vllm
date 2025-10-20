@@ -546,6 +546,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         q_inter_critical=query_inter_critical,
                         k=key,
                         v=value,
+                        key_cache=key_cache,
+                        value_cache=value_cache,
                         cu_seqlens_q=prefill_meta.query_start_loc,
                         cu_seqlens_k=prefill_meta.seq_start_loc,
                         orig_seq_lens=prefill_meta.orig_seq_lens,
@@ -557,6 +559,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         block_table=prefill_meta.block_tables,
                         chunk_size=self.chunk_size,
                         local_size=self.local_size,
+                        context_lens=prefill_meta.context_lens_tensor,
                     ))
 
         if decode_meta := attn_metadata.decode_metadata:
@@ -591,6 +594,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         q_inter_critical,
         k,
         v,
+        key_cache,
+        value_cache,
         cu_seqlens_q,
         cu_seqlens_k,
         orig_seq_lens: List[int],
@@ -602,6 +607,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         block_table: Optional[torch.Tensor] = None,
         chunk_size: int = 8192,
         local_size: int = 1024,
+        context_lens: Optional[torch.Tensor] = None,
     ):
        
         if alibi_slopes is not None:
@@ -632,7 +638,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
 
             current_k = k[ks:ke]
             current_v = v[ks:ke]
-            current_block_table = None
+            current_block_table = None if block_table is None else block_table[i]
+            current_context_len = 0 if context_lens is None else context_lens[i].item()
             current_orig_seq_len = orig_seq_lens[i]
             
             # sparse_attn_enabled = (self.sparse_attention_enabled
@@ -682,7 +689,10 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     current_q_inter_critical,
                     current_k,
                     current_v,
+                    key_cache,
+                    value_cache,
                     current_block_table,
+                    current_context_len,
                     softmax_scale,
                     chunk_size,
                     local_size,
@@ -724,7 +734,10 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         current_q_inter_head_critical,
                         current_k_head,
                         current_v_head,
+                        key_cache,
+                        value_cache,
                         current_block_table,
+                        current_context_len,
                         softmax_scale,
                         chunk_size,
                         local_size,
@@ -745,7 +758,10 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         q_inter_critical,
         k,
         v,
+        key_cache,
+        value_cache,
         block_table,
+        context_len: int,
         softmax_scale: float,
         chunk_size: int,
         local_size: int,
@@ -756,11 +772,16 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         heads_slash_size=None,
         group_size=None,
     ):
+        print(f"DEBUG:PREFILL_FUNC_ENTRY: q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}, "
+              f"context_len={context_len}, k_length={k_length}, "
+              f"key_cache.shape={key_cache.shape if block_table is not None else 'None'}")
+        
         flash_results = []
         chunk_len = chunk_size - local_size
 
         if block_table is not None:
-            block_size = v.shape[1]
+            # Get block_size from key_cache shape
+            block_size = key_cache.shape[3]
             if chunk_len % block_size != 0:
                 raise ValueError("chunk_len must be divisible by block_size.")
         else:
@@ -772,7 +793,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         begin = k_length - q.shape[0]
         while begin < k_length:
             print(f"DEBUG:PREFILL_CHUNK_LOOP: begin={begin}, k_length={k_length}, "
-                f"q.shape[0]={q.shape[0]}, chunk_len={chunk_len}")
+                f"q.shape[0]={q.shape[0]}, chunk_len={chunk_len}, context_len={context_len}")
             flash_per_chunk = []
             prev_chunk_end_pos = (begin // chunk_len) * chunk_len
             next_chunk_end_pos = prev_chunk_end_pos + chunk_len
@@ -782,16 +803,41 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
 
             qk_chunks = []
             q_states_intra = q[qbegin:qend]
-            # choose critical token
+            
+            # Read K/V for intra attention, handling cached vs fresh tokens
             if block_table is not None:
-                block_tables_intra = _get_block(block_table, block_size,
-                                                prev_chunk_end_pos, end)
-                k_states_intra = k[block_tables_intra].view(
-                    -1, *k.shape[-2:])[:(end - prev_chunk_end_pos)]
-                v_states_intra = v[block_tables_intra].view(
-                    -1, *v.shape[-2:])[:(end - prev_chunk_end_pos)]
+                # Determine range [prev_chunk_end_pos, end) - need to read from cache and/or fresh
+                if end <= context_len:
+                    # All tokens are cached - read from cache
+                    print(f"DEBUG:INTRA all cached: [{prev_chunk_end_pos}, {end})")
+                    k_states_intra, v_states_intra = _read_from_paged_cache(
+                        key_cache, value_cache, block_table, block_size,
+                        prev_chunk_end_pos, end)
+                elif prev_chunk_end_pos >= context_len:
+                    # All tokens are fresh - read from fresh k/v
+                    print(f"DEBUG:INTRA all fresh: [{prev_chunk_end_pos}, {end})")
+                    fresh_start = prev_chunk_end_pos - context_len
+                    fresh_end = end - context_len
+                    k_states_intra = k[fresh_start:fresh_end]
+                    v_states_intra = v[fresh_start:fresh_end]
+                else:
+                    # Mixed: some cached, some fresh - need to concatenate
+                    print(f"DEBUG:INTRA mixed: cached [{prev_chunk_end_pos}, {context_len}), fresh [{context_len}, {end})")
+                    # Cached portion
+                    k_cached, v_cached = _read_from_paged_cache(
+                        key_cache, value_cache, block_table, block_size,
+                        prev_chunk_end_pos, context_len)
+                    
+                    # Fresh portion
+                    fresh_start = 0
+                    fresh_end = end - context_len
+                    k_fresh = k[fresh_start:fresh_end]
+                    v_fresh = v[fresh_start:fresh_end]
+                    print("DCA_DEBUG: CACHE/FRESH SHAPES: k_cache_shape:", k_cached.shape, " k_fresh_shape: ", k_fresh.shape)
+                    # Concatenate
+                    k_states_intra = torch.cat([k_cached, k_fresh], dim=0)
+                    v_states_intra = torch.cat([v_cached, v_fresh], dim=0)
             else:
-                block_tables_intra = None
                 k_states_intra = k[prev_chunk_end_pos:end]
                 v_states_intra = v[prev_chunk_end_pos:end]
 
@@ -811,19 +857,45 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             if prev_chunk_end_pos - chunk_len >= 0:
                 q_states_succ = q_succ[qbegin:qend]
                 q_states_succ_critical = q_succ_critical[qbegin:qend]
+                
+                # Read K/V for succ attention, handling cached vs fresh tokens
+                succ_start = prev_chunk_end_pos - chunk_len
+                succ_end = prev_chunk_end_pos
+                
                 if block_table is not None:
-                    block_tables_succ = _get_block(
-                        block_table, block_size,
-                        prev_chunk_end_pos - chunk_len, prev_chunk_end_pos)
-                    k_states_succ = k[block_tables_succ].view(
-                        -1, *k.shape[-2:])[:chunk_len]
-                    v_states_succ = v[block_tables_succ].view(
-                        -1, *v.shape[-2:])[:chunk_len]
+                    if succ_end <= context_len:
+                        # All tokens are cached
+                        print(f"DEBUG:SUCC all cached: [{succ_start}, {succ_end})")
+                        k_states_succ, v_states_succ = _read_from_paged_cache(
+                            key_cache, value_cache, block_table, block_size,
+                            succ_start, succ_end)
+                    elif succ_start >= context_len:
+                        # All tokens are fresh
+                        print(f"DEBUG:SUCC all fresh: [{succ_start}, {succ_end})")
+                        fresh_start = succ_start - context_len
+                        fresh_end = succ_end - context_len
+                        k_states_succ = k[fresh_start:fresh_end]
+                        v_states_succ = v[fresh_start:fresh_end]
+                    else:
+                        # Mixed: some cached, some fresh
+                        print(f"DEBUG:SUCC mixed: cached [{succ_start}, {context_len}), fresh [{context_len}, {succ_end})")
+                        # Cached portion
+                        k_cached, v_cached = _read_from_paged_cache(
+                            key_cache, value_cache, block_table, block_size,
+                            succ_start, context_len)
+                        
+                        # Fresh portion
+                        fresh_start = 0
+                        fresh_end = succ_end - context_len
+                        k_fresh = k[fresh_start:fresh_end]
+                        v_fresh = v[fresh_start:fresh_end]
+                        
+                        # Concatenate
+                        k_states_succ = torch.cat([k_cached, k_fresh], dim=0)
+                        v_states_succ = torch.cat([v_cached, v_fresh], dim=0)
                 else:
-                    k_states_succ = k[prev_chunk_end_pos -
-                                      chunk_len:prev_chunk_end_pos]
-                    v_states_succ = v[prev_chunk_end_pos -
-                                      chunk_len:prev_chunk_end_pos]
+                    k_states_succ = k[succ_start:succ_end]
+                    v_states_succ = v[succ_start:succ_end]
 
                 if sparse_attn_enabled:
                     k_states_succ = (k_states_succ.unsqueeze(2).repeat(
@@ -841,17 +913,45 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             if prev_chunk_end_pos - chunk_len * 2 >= 0:
                 q_states_inter = q_inter[qbegin:qend]
                 q_states_inter_critical = q_inter_critical[qbegin:qend]
+                
+                # Read K/V for inter attention, handling cached vs fresh tokens
+                inter_start = 0
+                inter_end = prev_chunk_end_pos - chunk_len
+                
                 if block_table is not None:
-                    block_tables_inter = _get_block(
-                        block_table, block_size, 0,
-                        prev_chunk_end_pos - chunk_len)
-                    k_states_inter = k[block_tables_inter].view(
-                        -1, *k.shape[-2:])[:(prev_chunk_end_pos - chunk_len)]
-                    v_states_inter = v[block_tables_inter].view(
-                        -1, *v.shape[-2:])[:(prev_chunk_end_pos - chunk_len)]
+                    if inter_end <= context_len:
+                        # All tokens are cached
+                        print(f"DEBUG:INTER all cached: [{inter_start}, {inter_end})")
+                        k_states_inter, v_states_inter = _read_from_paged_cache(
+                            key_cache, value_cache, block_table, block_size,
+                            inter_start, inter_end)
+                    elif inter_start >= context_len:
+                        # All tokens are fresh
+                        print(f"DEBUG:INTER all fresh: [{inter_start}, {inter_end})")
+                        fresh_start = inter_start - context_len
+                        fresh_end = inter_end - context_len
+                        k_states_inter = k[fresh_start:fresh_end]
+                        v_states_inter = v[fresh_start:fresh_end]
+                    else:
+                        # Mixed: some cached, some fresh
+                        print(f"DEBUG:INTER mixed: cached [{inter_start}, {context_len}), fresh [{context_len}, {inter_end})")
+                        # Cached portion
+                        k_cached, v_cached = _read_from_paged_cache(
+                            key_cache, value_cache, block_table, block_size,
+                            inter_start, context_len)
+                        
+                        # Fresh portion
+                        fresh_start = 0
+                        fresh_end = inter_end - context_len
+                        k_fresh = k[fresh_start:fresh_end]
+                        v_fresh = v[fresh_start:fresh_end]
+                        
+                        # Concatenate
+                        k_states_inter = torch.cat([k_cached, k_fresh], dim=0)
+                        v_states_inter = torch.cat([v_cached, v_fresh], dim=0)
                 else:
-                    k_states_inter = k[:prev_chunk_end_pos - chunk_len]
-                    v_states_inter = v[:prev_chunk_end_pos - chunk_len]
+                    k_states_inter = k[inter_start:inter_end]
+                    v_states_inter = v[inter_start:inter_end]
 
                 if sparse_attn_enabled:
                     k_states_inter = (k_states_inter.unsqueeze(2).repeat(
@@ -1598,3 +1698,58 @@ def _get_block(block_table: torch.Tensor, block_size: int, begin: int,
     begin_block = begin // block_size
     end_block = (end - 1) // block_size + 1
     return block_table[begin_block:end_block]
+
+
+def _read_from_paged_cache(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    block_size: int,
+    begin: int,
+    end: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Read tokens from paged KV cache.
+    
+    Args:
+        key_cache: [num_blocks, num_kv_heads, head_size//x, block_size, x]
+        value_cache: [num_blocks, num_kv_heads, head_size, block_size]
+        block_table: Block indices for this sequence
+        block_size: Size of each block
+        begin: Start token position (inclusive)
+        end: End token position (exclusive)
+    
+    Returns:
+        k_states: [num_tokens, num_kv_heads, head_size]
+        v_states: [num_tokens, num_kv_heads, head_size]
+    """
+    num_tokens = end - begin
+    begin_block = begin // block_size
+    end_block = (end - 1) // block_size + 1
+    begin_offset = begin % block_size
+    
+    # Get the relevant blocks
+    blocks = block_table[begin_block:end_block]
+    
+    # Extract K: [num_blocks, num_kv_heads, head_size//x, block_size, x]
+    k_blocks = key_cache[blocks]  # [num_selected_blocks, num_kv_heads, head_size//x, block_size, x]
+    # First merge head_size dimensions: [num_selected_blocks, num_kv_heads, head_size, block_size]
+    num_selected_blocks, num_kv_heads, head_size_x, _, x = k_blocks.shape
+    k_blocks = k_blocks.reshape(num_selected_blocks, num_kv_heads, head_size_x * x, block_size)
+    # Now transpose to put block_size before head_size: [num_selected_blocks, num_kv_heads, block_size, head_size]
+    k_blocks = k_blocks.transpose(2, 3)
+    # Flatten blocks: [num_selected_blocks * block_size, num_kv_heads, head_size]
+    k_blocks = k_blocks.reshape(-1, num_kv_heads, head_size_x * x)
+    # Extract the exact range we need
+    k_states = k_blocks[begin_offset:begin_offset + num_tokens]
+    
+    # Extract V: [num_blocks, num_kv_heads, head_size, block_size]
+    v_blocks = value_cache[blocks]  # [num_selected_blocks, num_kv_heads, head_size, block_size]
+    # Transpose to put block_size before head_size: [num_selected_blocks, num_kv_heads, block_size, head_size]
+    v_blocks = v_blocks.transpose(2, 3)
+    # Flatten blocks: [num_selected_blocks * block_size, num_kv_heads, head_size]
+    v_blocks = v_blocks.reshape(-1, num_kv_heads, v_blocks.shape[-1])
+    # Extract the exact range we need
+    v_states = v_blocks[begin_offset:begin_offset + num_tokens]
+    
+    return k_states, v_states
