@@ -5,7 +5,7 @@
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
-
+NON_INTRA_CAUSAL = False
 import torch
 import torch.distributed
 import torch.nn.functional as F
@@ -21,12 +21,9 @@ from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import init_logger
 from vllm.utils import async_tensor_h2d
 
-from flash_attn import flash_attn_varlen_func, flash_attn_func, flash_attn_with_kvcache
+from flash_attn import flash_attn_varlen_func, flash_attn_func, flash_attn_with_kvcache#, sparse_attn_func
 # Use standard flash_attn_func as fallback for specialized functions  
-# flash_attn_with_kvcache = flash_attn_func
-sparse_attn_func = flash_attn_func  # Use standard function as fallback
-
-
+#sparse_attn_func = flash_attn_func  # Use standard function as fallback
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUBuilder
@@ -138,7 +135,8 @@ class DualChunkFlashAttentionMetadata(FlashAttentionMetadata):
                 0.1 * torch.log(prefill_metadata.orig_seq_lens_tensor /
                                 self.original_max_position_embeddings) +
                 1.0).clip(min=1)
-
+            print("DEBUG:SCALING FACTOR PREFILL:", prefill_metadata.scaling_factor)
+            print("DEBUG: orig_max_pos_emb:", self.original_max_position_embeddings)
         self._cached_prefill_metadata = prefill_metadata
         return prefill_metadata
 
@@ -173,6 +171,7 @@ class DualChunkFlashAttentionMetadata(FlashAttentionMetadata):
             decode_metadata.scaling_factor = (0.1 * torch.log(
                 cache_seq_lens / self.original_max_position_embeddings) +
                                               1.0).clip(min=1)
+            print("DEBUG:SCALING FACTOR DECODE:", decode_metadata.scaling_factor)
 
         seq_lens_intra = cache_seq_lens - chunk_num_curr * chunk_len
         max_seq_len_intra = seq_lens_intra.max().item()
@@ -237,6 +236,13 @@ class DualChunkFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
             chunked_prefill_enabled: bool, prefix_cache_hit: bool):
+        logger.warning(f'DCA_ADD_SEQ_GROUP: is_prompt={inter_data.is_prompt}, '
+                      f'chunked_prefill={chunked_prefill_enabled}, '
+                      f'inter_data.prompt_lens={inter_data.prompt_lens}, '
+                      f'inter_data.seq_lens={inter_data.seq_lens}, '
+                      f'inter_data.orig_seq_lens={inter_data.orig_seq_lens}, '
+                      f'inter_data.query_lens={inter_data.query_lens}, '
+                      f'inter_data.context_lens={inter_data.context_lens}')
         super()._add_seq_group(inter_data, chunked_prefill_enabled, prefix_cache_hit)
         for prompt_len, seq_len in zip(inter_data.prompt_lens,
                                        inter_data.seq_lens):
@@ -244,8 +250,15 @@ class DualChunkFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
 
     def build(self, seq_lens: List[int], query_lens: List[int],
               cuda_graph_pad_size: int, batch_size: int):
+        logger.warning(f'DCA_BUILD: seq_lens={seq_lens}, query_lens={query_lens}, '
+                      f'self.orig_seq_lens={self.orig_seq_lens}, '
+                      f'self.num_prefills={self.num_prefills}, '
+                      f'self.prefill_seq_lens={self.prefill_seq_lens}, '
+                      f'self.context_lens={self.context_lens}')
         attn_metadata = super().build(seq_lens, query_lens,
                                       cuda_graph_pad_size, batch_size)
+        logger.warning(f'DCA_BUILD_AFTER_SUPER: attn_metadata.seq_start_loc={attn_metadata.seq_start_loc}, '
+                      f'attn_metadata.seq_lens={attn_metadata.seq_lens}')
         attn_metadata = DualChunkFlashAttentionMetadata(
             **attn_metadata.asdict_zerocopy())
 
@@ -401,28 +414,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "fused output quantization is not yet supported"
                 " for FlashAttentionImpl")
-        # --- Begin added upstream tracing instrumentation ---
-        try:
-            orig_fused_query_dim = query.shape[-1]
-            print("DEBUG:DCA_FWD: incoming fused query shape =", query.shape,
-                  " num_heads=", self.num_heads, " head_size=", self.head_size,
-                  " num_kv_heads=", self.num_kv_heads,
-                  " num_queries_per_kv=", self.num_queries_per_kv)
-            if orig_fused_query_dim % (self.num_heads * self.head_size) == 0:
-                factor = orig_fused_query_dim // (self.num_heads * self.head_size)
-                print("DEBUG:DCA_FWD: fused_query_dim_factor =", factor,
-                      "(= fused_dim / (num_heads*head_size))")
-                if factor == 5:
-                    print("DEBUG:DCA_FWD: Detected 5-way fused DCA query (expected for dual chunk).")
-                else:
-                    print("DEBUG:DCA_FWD: Unexpected fusion factor (expected 5).")
-            else:
-                print("DEBUG:DCA_FWD: fused query dim NOT divisible by num_heads*head_size:",
-                      orig_fused_query_dim, "/", (self.num_heads * self.head_size))
-        except Exception as _e:
-            print("DEBUG:DCA_FWD: pre-split instrumentation exception", _e)
-        # --- End added upstream tracing instrumentation ---
-
+        
         (
             query,
             query_succ,
@@ -431,31 +423,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             query_inter_critical,
         ) = torch.split(query, query.shape[-1] // 5, dim=-1)
 
-        # --- DEBUG instrumentation to trace head mismatch issues ---
-        try:
-            # Capture raw part sizes before any reshape
-            print("DEBUG: DCA forward raw part sizes:")
-            print("DEBUG:   part0(query) shape:", query.shape)
-            print("DEBUG:   part1(query_succ) shape:", query_succ.shape)
-            print("DEBUG:   part2(query_inter) shape:", query_inter.shape)
-            print("DEBUG:   part3(query_succ_critical) shape:", query_succ_critical.shape)
-            print("DEBUG:   part4(query_inter_critical) shape:", query_inter_critical.shape)
-            inferred_hidden_size = query.shape[-1] * 5
-            expected_hidden_size = self.num_heads * self.head_size
-            if inferred_hidden_size != expected_hidden_size:
-                print("DEBUG: hidden_size_mismatch inferred_total=" , inferred_hidden_size,
-                      " expected=", expected_hidden_size,
-                      " num_heads=", self.num_heads,
-                      " head_size=", self.head_size)
-                if query.shape[-1] % self.head_size != 0:
-                    print("DEBUG: part0 length not divisible by head_size; part0_len=", query.shape[-1],
-                          " head_size=", self.head_size)
-            # Show intended reshape target
-            print("DEBUG: intended reshape for query parts -> (-1, num_heads=", self.num_heads,
-                  ", head_size=", self.head_size, ")")
-        except Exception as _e:  # pragma: no cover - debug safety
-            print("DEBUG: instrumentation exception", _e)
-
         assert (
             query_succ is not None and query_inter is not None
         ), "query_succ and query_inter are required in Dual Chunk Attention."
@@ -463,16 +430,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         num_tokens, hidden_size = query.shape
 
         # Reshape the query, key, and value tensors.
-        try:
-            print("DEBUG:DCA_FWD: pre-view raw part shapes main=", query.shape,
-                  " succ=", query_succ.shape, " inter=", query_inter.shape,
-                  " succ_crit=", query_succ_critical.shape, " inter_crit=", query_inter_critical.shape)
-            print("DEBUG:DCA_FWD: pre-view raw KV shapes key=", key.shape, " value=", value.shape,
-                  " expecting per-part dim=", self.num_heads * self.head_size,
-                  " num_heads=", self.num_heads, " num_kv_heads=", self.num_kv_heads,
-                  " head_size=", self.head_size)
-        except Exception as _e:
-            print("DEBUG:DCA_FWD: pre-view KV instrumentation exception", _e)
         query = query.view(-1, self.num_heads, self.head_size)
         query_succ = query_succ.view(-1, self.num_heads, self.head_size)
         query_inter = query_inter.view(-1, self.num_heads, self.head_size)
@@ -482,28 +439,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             -1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
         value = value.view(-1, self.num_kv_heads, self.head_size)
-        try:
-            print("DEBUG:DCA_FWD: post-view shapes q=", query.shape, " k=", key.shape,
-                  " v=", value.shape, " num_queries_per_kv=", self.num_queries_per_kv)
-        except Exception as _e:
-            print("DEBUG:DCA_FWD: post-view KV instrumentation exception", _e)
-
-        # Additional KV debug
-        try:
-            if key.shape[-1] != self.head_size:
-                print("DEBUG: key head_dim mismatch key.shape=", key.shape,
-                      " expected head_size=", self.head_size)
-            if value.shape[-1] != self.head_size:
-                print("DEBUG: value head_dim mismatch value.shape=", value.shape,
-                      " expected head_size=", self.head_size)
-            if query.shape[1] != self.num_heads:
-                print("DEBUG: query heads mismatch after view query.shape=", query.shape,
-                      " num_heads=", self.num_heads)
-            if key.shape[1] != self.num_kv_heads:
-                print("DEBUG: key kv_heads mismatch after view key.shape=", key.shape,
-                      " num_kv_heads=", self.num_kv_heads)
-        except Exception as _e:  # pragma: no cover
-            print("DEBUG: KV instrumentation exception", _e)
 
         paged_attn = self.paged_attn_module
 
@@ -668,44 +603,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         chunk_size: int = 8192,
         local_size: int = 1024,
     ):
-        # DEBUG: Log tensor shapes at function entry
-        print(f"DEBUG:DCA_PREFILL_ENTRY: k.shape={k.shape} v.shape={v.shape}")
-        print(f"DEBUG:DCA_PREFILL_ENTRY: q.shape={q.shape} q_succ.shape={q_succ.shape}")
-        print(f"DEBUG:DCA_PREFILL_ENTRY: cu_seqlens_q={cu_seqlens_q} cu_seqlens_k={cu_seqlens_k}")
-        
-        # # Ensure k and v are in the expected 3D format for flash attention
-        # if k.dim() != 3:
-        #     raise ValueError(f"Expected k to be 3D tensor [seq_len, num_kv_heads, head_dim], got shape {k.shape}")
-        # if v.dim() != 3:
-        #     raise ValueError(f"Expected v to be 3D tensor [seq_len, num_kv_heads, head_dim], got shape {v.shape}")
-        
-        # For GQA: expand KV heads to match query heads for flash attention compatibility
-        # k.shape=[seq_len, 1, head_dim] -> [seq_len, 8, head_dim] 
-        # v.shape=[seq_len, 1, head_dim] -> [seq_len, 8, head_dim]
-        # if k.shape[1] != q.shape[1]:  # num_kv_heads != num_heads (GQA case)
-        #     num_heads = q.shape[1]  # 8
-        #     num_kv_heads = k.shape[1]  # 1
-        #     repeat_factor = num_heads // num_kv_heads  # 8
-            
-        #     # Expand KV tensors to match query heads
-        #     k = k.repeat_interleave(repeat_factor, dim=1)
-        #     v = v.repeat_interleave(repeat_factor, dim=1)
-            
-        #     print(f"DEBUG:DCA_PREFILL_ENTRY: Expanded k from {k.shape[0], num_kv_heads, k.shape[2]} to {k.shape}")
-        #     print(f"DEBUG:DCA_PREFILL_ENTRY: Expanded v from {v.shape[0], num_kv_heads, v.shape[2]} to {v.shape}")
-        
-        # print(f"DEBUG:DCA_PREFILL_ENTRY: Final k.shape={k.shape} v.shape={v.shape}")
-            
-        # # Validate dimensions match expected format
-        # if k.shape != v.shape:
-        #     raise ValueError(f"Key and value shapes must match: k.shape={k.shape}, v.shape={v.shape}")
-            
-        # # Verify sequence lengths match query
-        # if k.shape[0] != q.shape[0]:
-        #     # For prefill, k/v should contain all tokens in the sequence, not just current batch
-        #     print(f"DEBUG:DCA_PREFILL_ENTRY: Sequence length mismatch: k.shape[0]={k.shape[0]}, q.shape[0]={q.shape[0]}")
-        #     # This is expected in prefill mode where k/v may contain cached data
-        
+       
         if alibi_slopes is not None:
             raise ValueError(
                 "Dual Chunk Attention does not support alibi_slopes")
@@ -715,14 +613,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         if window_size != (-1, -1):
             raise ValueError(
                 "Dual Chunk Attention does not support window_size")
-
         cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
         cu_seqlens_k_cpu = cu_seqlens_k.cpu().tolist()
-        
-        # DEBUG: Log sequence length info
-        print(f"DEBUG:DCA_PREFILL: cu_seqlens_q_cpu={cu_seqlens_q_cpu}")
-        print(f"DEBUG:DCA_PREFILL: cu_seqlens_k_cpu={cu_seqlens_k_cpu}")
-        print(f"DEBUG:DCA_PREFILL: orig_seq_lens={orig_seq_lens}")
         
         all_outputs = []
 
@@ -731,9 +623,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             qe = cu_seqlens_q_cpu[i:i + 2][-1]
             ks = cu_seqlens_k_cpu[i]
             ke = cu_seqlens_k_cpu[i:i + 2][-1]
-            
-            # DEBUG: Log slicing indices
-            print(f"DEBUG:DCA_PREFILL: seq {i}: qs={qs} qe={qe} ks={ks} ke={ke}")
 
             current_q = q[qs:qe]
             current_q_succ = q_succ[qs:qe]
@@ -741,25 +630,15 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             current_q_succ_critical = q_succ_critical[qs:qe]
             current_q_inter_critical = q_inter_critical[qs:qe]
 
-            if True or block_table is None:
-                current_k = k[ks:ke]
-                current_v = v[ks:ke]
-                current_block_table = None
-                current_orig_seq_len = orig_seq_lens[i]
-            else:
-                current_block_table = block_table[i]
-                current_orig_seq_len = orig_seq_lens[i]
-                current_k = k
-                current_v = v
+            current_k = k[ks:ke]
+            current_v = v[ks:ke]
+            current_block_table = None
+            current_orig_seq_len = orig_seq_lens[i]
             
-            # DEBUG: Log shapes at this level before per-head processing
-            print(f"DEBUG:DCA_PREFILL: after slicing current_k.shape={current_k.shape} current_v.shape={current_v.shape}")
-            print(f"DEBUG:DCA_PREFILL: block_table_exists={block_table is not None} num_queries_per_kv={self.num_queries_per_kv}")
-            print(f"DEBUG:DCA_PREFILL: current_q.shape={current_q.shape}")
-            sparse_attn_enabled = (self.sparse_attention_enabled
-                                   and current_orig_seq_len
-                                   > self.sparse_attention_threshold)
-
+            # sparse_attn_enabled = (self.sparse_attention_enabled
+            #                        and current_orig_seq_len
+            #                        > self.sparse_attention_threshold)
+            sparse_attn_enabled = False
             if current_q.shape[0] == 0:
                 continue
 
@@ -836,9 +715,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                                                group_size, :].unsqueeze(1)
                     current_v_head = current_v[:, head_id //
                                                group_size, :].unsqueeze(1)
-                    print(f"DEBUG:DCA_PREFILL_PER_HEAD: non-block case head_id={head_id} group_size={group_size} gqa={self.num_queries_per_kv > 1}")
-                    print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_k_head.shape={current_k_head.shape}")
-                    print(f"DEBUG:DCA_PREFILL_PER_HEAD: current_v_head.shape={current_v_head.shape}")
 
                     current_out = self._dual_chunk_flash_attn_prefill_func(
                         current_q_head,
@@ -880,14 +756,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         heads_slash_size=None,
         group_size=None,
     ):
-        try:
-            print("DEBUG:DCA_PREFILL_FUNC: entry q=", q.shape, " k=", k.shape, " v=", v.shape,
-                  " sparse=", sparse_attn_enabled, " group_size=", group_size,
-                  " chunk_size=", chunk_size, " local_size=", local_size,
-                  " k_length=", k_length, " softmax_scale=", softmax_scale,
-                  " scaling_factor=", scaling_factor)
-        except Exception as _e:
-            print("DEBUG:DCA_PREFILL_FUNC: entry instrumentation exception", _e)
         flash_results = []
         chunk_len = chunk_size - local_size
 
@@ -903,8 +771,9 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
 
         begin = k_length - q.shape[0]
         while begin < k_length:
+            print(f"DEBUG:PREFILL_CHUNK_LOOP: begin={begin}, k_length={k_length}, "
+                f"q.shape[0]={q.shape[0]}, chunk_len={chunk_len}")
             flash_per_chunk = []
-
             prev_chunk_end_pos = (begin // chunk_len) * chunk_len
             next_chunk_end_pos = prev_chunk_end_pos + chunk_len
             end = min(next_chunk_end_pos, k_length)
@@ -925,11 +794,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 block_tables_intra = None
                 k_states_intra = k[prev_chunk_end_pos:end]
                 v_states_intra = v[prev_chunk_end_pos:end]
-                
-            print(f"DEBUG:DCA_PREFILL_FUNC_SLICE: prev_chunk_end_pos={prev_chunk_end_pos} end={end}")
-            print(f"DEBUG:DCA_PREFILL_FUNC_SLICE: k_states_intra.shape={k_states_intra.shape}")
-            print(f"DEBUG:DCA_PREFILL_FUNC_SLICE: v_states_intra.shape={v_states_intra.shape}")
-            print(f"DEBUG:DCA_PREFILL_FUNC_SLICE: block_tables_intra={block_tables_intra is not None}")
 
             if sparse_attn_enabled:
                 last_q_size = min(qend - qbegin, self.sparse_attention_last_q)
@@ -1253,7 +1117,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         k_states_succ,
                         v_states_succ,
                         softmax_scale=softmax_scale,
-                        causal=False,
+                        causal=NON_INTRA_CAUSAL,
                         stage="succ",
                         vertical_indices=succ_vertical_buffer,
                         slash_indices=succ_slash_buffer,
@@ -1267,7 +1131,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         k_states_succ,
                         v_states_succ,
                         softmax_scale=softmax_scale,
-                        causal=False,
+                        causal=NON_INTRA_CAUSAL,
                         stage="succ",
                         vertical_indices=succ_vertical_indices,
                         slash_indices=succ_slash_indices,
@@ -1281,7 +1145,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         k_states_inter,
                         v_states_inter,
                         softmax_scale=softmax_scale,
-                        causal=False,
+                        causal=NON_INTRA_CAUSAL,
                         stage="inter",
                         vertical_indices=inter_vertical_buffer,
                         slash_indices=inter_slash_buffer,
@@ -1295,7 +1159,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                         k_states_inter,
                         v_states_inter,
                         softmax_scale=softmax_scale,
-                        causal=False,
+                        causal=NON_INTRA_CAUSAL,
                         stage="inter",
                         vertical_indices=inter_vertical_indices,
                         slash_indices=inter_slash_indices,
@@ -1304,7 +1168,8 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
 
             flash_results.append(flash_per_chunk)
             begin = end
-
+        print(f"DEBUG:PREFILL_CHUNK_LOOP: end of iteration, begin now={begin}, "
+        f"flash_results length={len(flash_results)}")
         attn_output = self._merge_attn_outputs(flash_results)
         del flash_results
         return attn_output
@@ -1331,19 +1196,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         q_len = query_states.shape[0]
         q_heads = query_states.shape[1]
         h_dim = query_states.shape[-1]
-        # try:
-        #     prod_q = q_heads * h_dim
-        #     prod_k = key_states.shape[1] * key_states.shape[-1]
-        #     print("DEBUG:DCA_DO: entry stage=", stage, " q=", query_states.shape,
-        #           " k=", key_states.shape, " v=", value_states.shape,
-        #           " q_heads*dim=", prod_q, " k_heads*dim=", prod_k,
-        #           " causal=", causal, " sparse=", sparse_attn_enabled)
-        #     if q_heads == 1 and key_states.shape[1] > 1 and prod_q == prod_k:
-        #         print("DEBUG:DCA_DO: DETECTED_INVERTED_GQA q has aggregated head, k split into more heads (k_heads=", key_states.shape[1], ")")
-        #     if key_states.shape[-1] != h_dim and prod_q == prod_k:
-        #         print("DEBUG:DCA_DO: per-head dim mismatch but total fused dimension matches; likely head factoring difference")
-        # except Exception as _e:
-        #     print("DEBUG:DCA_DO: entry instrumentation exception", _e)
 
         if sparse_attn_enabled:
             assert slash_indices is not None
@@ -1393,39 +1245,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 s_lse = s_lse.view(q_len, q_heads, 1).transpose(0, 2).float()
             return res, s_lse
 
-        # if key_states.numel() == 0 or value_states.numel() == 0:
-        #     # Handle empty tensor case - return empty output with correct shape
-        #     output = torch.empty(query_states.shape[0], query_states.shape[1], query_states.shape[2], 
-        #                        dtype=query_states.dtype, device=query_states.device)
-        #     softmax_lse = torch.zeros((1, q_heads, q_len), device=query_states.device, dtype=torch.float32)
-        #     return output, softmax_lse
-        
-        # Log input tensor statistics before kernel call
-        try:
-            q_norm = torch.linalg.vector_norm(query_states.float()).item()
-            k_norm = torch.linalg.vector_norm(key_states.float()).item()
-            v_norm = torch.linalg.vector_norm(value_states.float()).item()
-            q_has_nan = torch.isnan(query_states).any().item()
-            q_has_inf = torch.isinf(query_states).any().item()
-            k_has_nan = torch.isnan(key_states).any().item()
-            k_has_inf = torch.isinf(key_states).any().item()
-            v_has_nan = torch.isnan(value_states).any().item()
-            v_has_inf = torch.isinf(value_states).any().item()
-            q_min = query_states.min().item()
-            q_max = query_states.max().item()
-            k_min = key_states.min().item()
-            k_max = key_states.max().item()
-            v_min = value_states.min().item()
-            v_max = value_states.max().item()
-            print(f"DEBUG:PRE_KERNEL_INPUT stage={stage} causal={causal} softmax_scale={softmax_scale}")
-            print(f"DEBUG:  query_states: shape={tuple(query_states.shape)} norm={q_norm:.6f} "
-                  f"nan={q_has_nan} inf={q_has_inf} min={q_min:.6f} max={q_max:.6f}")
-            print(f"DEBUG:  key_states: shape={tuple(key_states.shape)} norm={k_norm:.6f} "
-                  f"nan={k_has_nan} inf={k_has_inf} min={k_min:.6f} max={k_max:.6f}")
-            print(f"DEBUG:  value_states: shape={tuple(value_states.shape)} norm={v_norm:.6f} "
-                  f"nan={v_has_nan} inf={v_has_inf} min={v_min:.6f} max={v_max:.6f}")
-        except Exception as e:
-            print(f"DEBUG:PRE_KERNEL_INPUT exception: {e}")
 
         output, softmax_lse, _ = flash_attn_varlen_func(
             q=query_states,
@@ -1502,10 +1321,10 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             lse_s = torch.exp(stable_logits).detach()
             lse_sum = torch.sum(lse_s, dim=0)
             lse_s /= lse_sum
-            print("debug:MERGE: attn_outputs.shape=", attn_outputs.shape, "lse_s.shape=", lse_s.shape)
-            #attn_outputs *= lse_s.unsqueeze(-1).transpose(2, 3).squeeze(1)
+            print("DEBUG:MERGE_ATTN: attn_outputs.shape=", attn_outputs.shape, "lse_s.shape=", lse_s.shape)
+            #attn_outputs *= lse_s.unsqueeze(-1).transpose(2, 3).squeeze(1) [num_chunks, seq_len, num_heads, head_dim], lse: [num_chunks, num_heads, seq_len]
             lse_s_reshaped = lse_s.transpose(1, 2).unsqueeze(-1)  # [num_chunks, seq_len, num_heads, 1]
-            print("debug:MERGE: after reshape lse_s_reshaped.shape=", lse_s_reshaped.shape)
+            print("DEBUG:MERGE_ATTN: after reshape lse_s_reshaped.shape=", lse_s_reshaped.shape)
             attn_outputs *= lse_s_reshaped
             attn_outputs_all.append(attn_outputs.sum(dim=0))
 
@@ -1563,7 +1382,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 decode_meta.seq_lens_intra,
                 softmax_scale,
                 alibi_slopes,
-                causal=False,
+                causal=NON_INTRA_CAUSAL,
             ))
         outputs_list.append(intra_output)
         softmax_lses_list.append(intra_softmax_lse)
@@ -1579,7 +1398,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     decode_meta.seq_lens_succ,
                     softmax_scale,
                     alibi_slopes,
-                    causal=False,
+                    causal=NON_INTRA_CAUSAL,
                 ))
             outputs_list.append(succ_output)
             softmax_lses_list.append(succ_softmax_lse)
@@ -1595,7 +1414,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     decode_meta.seq_lens_inter,
                     softmax_scale,
                     alibi_slopes,
-                    causal=False,
+                    causal=NON_INTRA_CAUSAL,
                 ))
             outputs_list.append(inter_output)
             softmax_lses_list.append(inter_softmax_lse)
@@ -1669,7 +1488,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         )
         # Generate dummy softmax_lse for compatibility
         #softmax_lse = torch.zeros((out.shape[0], out.shape[1], out.shape[2]), device=out.device, dtype=torch.float32)
-        # cache_seqlens is 0 when there is no valid key/value to attend to, proportion is:
         cache_seqlens_eq0_ratio = (cache_seqlens == 0).float().mean().item()
         print("DEBUG:DCA_DECODE: out.shape=", out.shape,
               f" ratio_cache_seqlens_eq0={cache_seqlens_eq0_ratio:.6f}")
