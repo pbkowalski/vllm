@@ -1591,19 +1591,10 @@ def reshape_and_cache(
     k_scale: torch.Tensor,
     v_scale: torch.Tensor,
 ) -> None:
-    print(f"DEBUG reshape_and_cache: key.shape={key.shape}, value.shape={value.shape}")
-    print(f"DEBUG reshape_and_cache: key_cache.shape={key_cache.shape}, value_cache.shape={value_cache.shape}")
-    print(f"DEBUG reshape_and_cache: slot_mapping.shape={slot_mapping.shape}, kv_cache_dtype={kv_cache_dtype}")
-    print(f"DEBUG reshape_and_cache: k_scale.shape={k_scale.shape}, v_scale.shape={v_scale.shape}")
-    print(f"DEBUG reshape_and_cache: slot_mapping dtype={slot_mapping.dtype}, slot_mapping contents={slot_mapping}")
-    try:
-        torch.ops._C_cache_ops.reshape_and_cache(key, value, key_cache,
-                                                 value_cache, slot_mapping,
-                                                 kv_cache_dtype, k_scale, v_scale)
-    except Exception as e:
-        print(f"DEBUG reshape_and_cache: Exception occurred: {e}")
-        print(f"DEBUG reshape_and_cache: Exception type: {type(e)}")
-        raise
+
+    torch.ops._C_cache_ops.reshape_and_cache(key, value, key_cache,
+                                             value_cache, slot_mapping,
+                                             kv_cache_dtype, k_scale, v_scale)
 
 
 def reshape_and_cache_flash(
