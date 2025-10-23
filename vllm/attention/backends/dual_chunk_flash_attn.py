@@ -135,8 +135,6 @@ class DualChunkFlashAttentionMetadata(FlashAttentionMetadata):
                 0.1 * torch.log(prefill_metadata.orig_seq_lens_tensor /
                                 self.original_max_position_embeddings) +
                 1.0).clip(min=1)
-            print("DEBUG:SCALING FACTOR PREFILL:", prefill_metadata.scaling_factor)
-            print("DEBUG: orig_max_pos_emb:", self.original_max_position_embeddings)
         self._cached_prefill_metadata = prefill_metadata
         return prefill_metadata
 
@@ -171,7 +169,6 @@ class DualChunkFlashAttentionMetadata(FlashAttentionMetadata):
             decode_metadata.scaling_factor = (0.1 * torch.log(
                 cache_seq_lens / self.original_max_position_embeddings) +
                                               1.0).clip(min=1)
-            print("DEBUG:SCALING FACTOR DECODE:", decode_metadata.scaling_factor)
 
         seq_lens_intra = cache_seq_lens - chunk_num_curr * chunk_len
         max_seq_len_intra = seq_lens_intra.max().item()
@@ -236,13 +233,6 @@ class DualChunkFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
     def _add_seq_group(
             self, inter_data: "ModelInputForGPUBuilder.InterDataForSeqGroup",
             chunked_prefill_enabled: bool, prefix_cache_hit: bool):
-        logger.warning(f'DCA_ADD_SEQ_GROUP: is_prompt={inter_data.is_prompt}, '
-                      f'chunked_prefill={chunked_prefill_enabled}, '
-                      f'inter_data.prompt_lens={inter_data.prompt_lens}, '
-                      f'inter_data.seq_lens={inter_data.seq_lens}, '
-                      f'inter_data.orig_seq_lens={inter_data.orig_seq_lens}, '
-                      f'inter_data.query_lens={inter_data.query_lens}, '
-                      f'inter_data.context_lens={inter_data.context_lens}')
         super()._add_seq_group(inter_data, chunked_prefill_enabled, prefix_cache_hit)
         for prompt_len, seq_len in zip(inter_data.prompt_lens,
                                        inter_data.seq_lens):
@@ -250,15 +240,8 @@ class DualChunkFlashAttentionMetadataBuilder(FlashAttentionMetadataBuilder):
 
     def build(self, seq_lens: List[int], query_lens: List[int],
               cuda_graph_pad_size: int, batch_size: int):
-        logger.warning(f'DCA_BUILD: seq_lens={seq_lens}, query_lens={query_lens}, '
-                      f'self.orig_seq_lens={self.orig_seq_lens}, '
-                      f'self.num_prefills={self.num_prefills}, '
-                      f'self.prefill_seq_lens={self.prefill_seq_lens}, '
-                      f'self.context_lens={self.context_lens}')
         attn_metadata = super().build(seq_lens, query_lens,
                                       cuda_graph_pad_size, batch_size)
-        logger.warning(f'DCA_BUILD_AFTER_SUPER: attn_metadata.seq_start_loc={attn_metadata.seq_start_loc}, '
-                      f'attn_metadata.seq_lens={attn_metadata.seq_lens}')
         attn_metadata = DualChunkFlashAttentionMetadata(
             **attn_metadata.asdict_zerocopy())
 
@@ -489,7 +472,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         num_prefill_tokens = attn_metadata.num_prefill_tokens
         num_decode_tokens = attn_metadata.num_decode_tokens
 
-        #logger.warning('{} {} {}'.format(key.shape[0], num_prefill_tokens, num_decode_tokens))
         assert key.shape[0] == num_prefill_tokens + num_decode_tokens
         assert value.shape[0] == num_prefill_tokens + num_decode_tokens
         
@@ -619,6 +601,10 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         if window_size != (-1, -1):
             raise ValueError(
                 "Dual Chunk Attention does not support window_size")
+        if self.sparse_attention_enabled:
+            raise NotImplementedError(
+                "Sparse attention is not yet supported in "
+                "ROCm Dual Chunk Flash Attention prefill.")
         cu_seqlens_q_cpu = cu_seqlens_q.cpu().tolist()
         cu_seqlens_k_cpu = cu_seqlens_k.cpu().tolist()
         
@@ -772,9 +758,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         heads_slash_size=None,
         group_size=None,
     ):
-        print(f"DEBUG:PREFILL_FUNC_ENTRY: q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}, "
-              f"context_len={context_len}, k_length={k_length}, "
-              f"key_cache.shape={key_cache.shape if block_table is not None else 'None'}")
         
         flash_results = []
         chunk_len = chunk_size - local_size
@@ -792,8 +775,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
 
         begin = k_length - q.shape[0]
         while begin < k_length:
-            print(f"DEBUG:PREFILL_CHUNK_LOOP: begin={begin}, k_length={k_length}, "
-                f"q.shape[0]={q.shape[0]}, chunk_len={chunk_len}, context_len={context_len}")
             flash_per_chunk = []
             prev_chunk_end_pos = (begin // chunk_len) * chunk_len
             next_chunk_end_pos = prev_chunk_end_pos + chunk_len
@@ -809,20 +790,17 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 # Determine range [prev_chunk_end_pos, end) - need to read from cache and/or fresh
                 if end <= context_len:
                     # All tokens are cached - read from cache
-                    print(f"DEBUG:INTRA all cached: [{prev_chunk_end_pos}, {end})")
                     k_states_intra, v_states_intra = _read_from_paged_cache(
                         key_cache, value_cache, block_table, block_size,
                         prev_chunk_end_pos, end)
                 elif prev_chunk_end_pos >= context_len:
                     # All tokens are fresh - read from fresh k/v
-                    print(f"DEBUG:INTRA all fresh: [{prev_chunk_end_pos}, {end})")
                     fresh_start = prev_chunk_end_pos - context_len
                     fresh_end = end - context_len
                     k_states_intra = k[fresh_start:fresh_end]
                     v_states_intra = v[fresh_start:fresh_end]
                 else:
                     # Mixed: some cached, some fresh - need to concatenate
-                    print(f"DEBUG:INTRA mixed: cached [{prev_chunk_end_pos}, {context_len}), fresh [{context_len}, {end})")
                     # Cached portion
                     k_cached, v_cached = _read_from_paged_cache(
                         key_cache, value_cache, block_table, block_size,
@@ -833,7 +811,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                     fresh_end = end - context_len
                     k_fresh = k[fresh_start:fresh_end]
                     v_fresh = v[fresh_start:fresh_end]
-                    print("DCA_DEBUG: CACHE/FRESH SHAPES: k_cache_shape:", k_cached.shape, " k_fresh_shape: ", k_fresh.shape)
                     # Concatenate
                     k_states_intra = torch.cat([k_cached, k_fresh], dim=0)
                     v_states_intra = torch.cat([v_cached, v_fresh], dim=0)
@@ -865,20 +842,17 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 if block_table is not None:
                     if succ_end <= context_len:
                         # All tokens are cached
-                        print(f"DEBUG:SUCC all cached: [{succ_start}, {succ_end})")
                         k_states_succ, v_states_succ = _read_from_paged_cache(
                             key_cache, value_cache, block_table, block_size,
                             succ_start, succ_end)
                     elif succ_start >= context_len:
                         # All tokens are fresh
-                        print(f"DEBUG:SUCC all fresh: [{succ_start}, {succ_end})")
                         fresh_start = succ_start - context_len
                         fresh_end = succ_end - context_len
                         k_states_succ = k[fresh_start:fresh_end]
                         v_states_succ = v[fresh_start:fresh_end]
                     else:
                         # Mixed: some cached, some fresh
-                        print(f"DEBUG:SUCC mixed: cached [{succ_start}, {context_len}), fresh [{context_len}, {succ_end})")
                         # Cached portion
                         k_cached, v_cached = _read_from_paged_cache(
                             key_cache, value_cache, block_table, block_size,
@@ -921,20 +895,17 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
                 if block_table is not None:
                     if inter_end <= context_len:
                         # All tokens are cached
-                        print(f"DEBUG:INTER all cached: [{inter_start}, {inter_end})")
                         k_states_inter, v_states_inter = _read_from_paged_cache(
                             key_cache, value_cache, block_table, block_size,
                             inter_start, inter_end)
                     elif inter_start >= context_len:
                         # All tokens are fresh
-                        print(f"DEBUG:INTER all fresh: [{inter_start}, {inter_end})")
                         fresh_start = inter_start - context_len
                         fresh_end = inter_end - context_len
                         k_states_inter = k[fresh_start:fresh_end]
                         v_states_inter = v[fresh_start:fresh_end]
                     else:
                         # Mixed: some cached, some fresh
-                        print(f"DEBUG:INTER mixed: cached [{inter_start}, {context_len}), fresh [{context_len}, {inter_end})")
                         # Cached portion
                         k_cached, v_cached = _read_from_paged_cache(
                             key_cache, value_cache, block_table, block_size,
@@ -1268,8 +1239,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
 
             flash_results.append(flash_per_chunk)
             begin = end
-        print(f"DEBUG:PREFILL_CHUNK_LOOP: end of iteration, begin now={begin}, "
-        f"flash_results length={len(flash_results)}")
         attn_output = self._merge_attn_outputs(flash_results)
         del flash_results
         return attn_output
@@ -1363,28 +1332,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             return_attn_probs = True,
         )
         
-        # Log output tensor statistics after kernel call
-        try:
-            out_norm = torch.linalg.vector_norm(output.float()).item()
-            out_has_nan = torch.isnan(output).any().item()
-            out_has_inf = torch.isinf(output).any().item()
-            out_min = output.min().item()
-            out_max = output.max().item()
-            print(f"DEBUG:POST_KERNEL_OUTPUT stage={stage}")
-            print(f"DEBUG:  output: shape={tuple(output.shape)} norm={out_norm:.6f} "
-                  f"nan={out_has_nan} inf={out_has_inf} min={out_min:.6f} max={out_max:.6f}")
-        except Exception as e:
-            print(f"DEBUG:POST_KERNEL_OUTPUT exception: {e}")
-        
-        # Generate dummy softmax_lse for merging - this is a simplified approach
-        # In practice, we would need a more sophisticated merging strategy
-        #softmax_lse = torch.zeros((1, q_heads, q_len), device=query_states.device, dtype=torch.float32)
-        
-        try:
-            print(f"DEBUG:  softmax_lse: shape={tuple(softmax_lse.shape)}")
-        except Exception as e:
-            print(f"DEBUG:SOFTMAX_LSE logging exception: {e}")
-        
         return output, softmax_lse
 
     def _merge_attn_outputs(
@@ -1421,10 +1368,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             lse_s = torch.exp(stable_logits).detach()
             lse_sum = torch.sum(lse_s, dim=0)
             lse_s /= lse_sum
-            print("DEBUG:MERGE_ATTN: attn_outputs.shape=", attn_outputs.shape, "lse_s.shape=", lse_s.shape)
-            #attn_outputs *= lse_s.unsqueeze(-1).transpose(2, 3).squeeze(1) [num_chunks, seq_len, num_heads, head_dim], lse: [num_chunks, num_heads, seq_len]
             lse_s_reshaped = lse_s.transpose(1, 2).unsqueeze(-1)  # [num_chunks, seq_len, num_heads, 1]
-            print("DEBUG:MERGE_ATTN: after reshape lse_s_reshaped.shape=", lse_s_reshaped.shape)
             attn_outputs *= lse_s_reshaped
             attn_outputs_all.append(attn_outputs.sum(dim=0))
 
@@ -1527,11 +1471,7 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         lse_s = torch.exp(stable_logits).detach()
         lse_sum = torch.sum(lse_s, dim=0)
         lse_s /= lse_sum
-        print("DEBUG:DCA_DECODE_MERGE: outputs.shape=", outputs.shape,
-      " softmax_lses.shape=", softmax_lses.shape,
-      " lse_s.shape=", lse_s.shape)
         lse_s=lse_s.transpose(-1, -2).unsqueeze(-1)  # [num_chunks, seq_len, num_heads]
-        print("DEBUG:DCA_DECODE_MERGE: reshaped lse_s", lse_s.shape)
         outputs *= lse_s
 
         return outputs.sum(0)
@@ -1558,12 +1498,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         #   key_cache:  [num_blocks, block_size, num_kv_heads, num_query_heads]
         #   value_cache:[num_blocks, block_size, num_kv_heads, head_size]
 
-        try:  # pragma: no cover - debug / safe guard
-            original_key_shape = tuple(key_cache.shape)
-            original_value_shape = tuple(value_cache.shape)
-            print(f"DEBUG:DCA_DECODE: raw key_cache.shape={original_key_shape} value_cache.shape={original_value_shape}")
-        except Exception:
-            pass
         # Call flash attention with transformed caches
         # Reshape key_cache from [num_blocks, num_kv_heads, head_size//x, block_size, x]
         # to [num_blocks, block_size, num_kv_heads, head_size]
@@ -1571,9 +1505,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
         # Reshape value_cache from [num_blocks, num_kv_heads, head_size, block_size]
         # to [num_blocks, block_size, num_kv_heads, head_size]
         value_cache_fa = value_cache.transpose(2,3).transpose(1,2).contiguous()
-        print(f"DEBUG:DCA_DECODE: reshaped key_cache.shape={key_cache_fa.shape} value_cache.shape={value_cache_fa.shape}, "
-              f"contiguous: {key_cache_fa.is_contiguous()} {value_cache_fa.is_contiguous()}, "
-              f"last_dim_stride: {key_cache_fa.stride(-1)}, {value_cache_fa.stride(-1)}")
 
         out, softmax_lse = flash_attn_with_kvcache(
             q=query,
@@ -1586,11 +1517,6 @@ class DualChunkFlashAttentionImpl(FlashAttentionImpl):
             causal=causal,
             return_softmax_lse=True,
         )
-        # Generate dummy softmax_lse for compatibility
-        #softmax_lse = torch.zeros((out.shape[0], out.shape[1], out.shape[2]), device=out.device, dtype=torch.float32)
-        cache_seqlens_eq0_ratio = (cache_seqlens == 0).float().mean().item()
-        print("DEBUG:DCA_DECODE: out.shape=", out.shape,
-              f" ratio_cache_seqlens_eq0={cache_seqlens_eq0_ratio:.6f}")
         mask = (cache_seqlens == 0)
         out[mask] = 0
         softmax_lse[mask] = -float("inf")
